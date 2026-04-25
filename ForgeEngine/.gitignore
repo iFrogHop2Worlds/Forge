@@ -1,0 +1,10 @@
+# Cargo build artifacts
+/target/
+
+# Cargo lock file (optional for libraries)
+Cargo.lock
+
+# ForgeEngine generated files
+*.wal
+*.sst
+*.manifest

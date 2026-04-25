@@ -1,0 +1,8 @@
+[package]
+name = "ForgeCli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ForgeEngine = { path = "../ForgeEngine" } # Connects the two
+clap = { version = "4.0", features = ["derive"] }

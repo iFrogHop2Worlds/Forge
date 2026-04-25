@@ -1,0 +1,6 @@
+# Cargo build artifacts
+/target/
+
+# Runtime data directories
+/_demo_data/
+/forge_data/

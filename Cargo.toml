@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "ForgeEngine",
+    "ForgeCli",
+]
+resolver = "2" # Best for feature isolation between crates

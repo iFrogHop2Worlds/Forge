@@ -1,0 +1,26 @@
+# Rust build artifacts
+/target/
+**/target/
+
+# Cargo.lock for libraries (keep for binaries)
+/ForgeEngine/Cargo.lock
+
+# Runtime data directories
+/_alt_data/
+/_demo_data/
+/forge_data/
+/ForgeCli/_demo_data/
+/ForgeCli/forge_data/
+
+# IntelliJ IDEA
+.idea/
+*.iml
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# Linux
+*~
