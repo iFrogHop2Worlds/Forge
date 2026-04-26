@@ -1,7 +1,8 @@
 # Rust build artifacts
 /target/
 **/target/
-
+/target_bench/
+**/target_bench/
 # Cargo.lock for libraries (keep for binaries)
 /ForgeEngine/Cargo.lock
 

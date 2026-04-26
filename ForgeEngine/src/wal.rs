@@ -13,7 +13,7 @@ pub struct Wal {
 }
 
 impl Wal {
-    const FLUSH_BYTES: usize = 64 * 1024;
+    const FLUSH_BYTES: usize = 256 * 1024;
 
     pub fn open(dir: &Path) -> Result<Self> {
         let path = dir.join("current.wal");

@@ -8,9 +8,9 @@ use crate::sstable::{reader, writer};
 use crate::types::{Entry, Result, ValueRef};
 use crate::wal::Wal;
 
-const DEFAULT_MEMTABLE_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_MEMTABLE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_LEVEL: usize = 3;
-const LEVEL_COMPACTION_THRESHOLD: [usize; MAX_LEVEL + 1] = [16, 16, 16, usize::MAX];
+const LEVEL_COMPACTION_THRESHOLD: [usize; MAX_LEVEL + 1] = [9, 9, 9, usize::MAX];
 
 #[derive(Debug)]
 pub struct Db {
