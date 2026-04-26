@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 ForgeEngine = { path = "../ForgeEngine" } # Connects the two
 clap = { version = "4.0", features = ["derive"] }
+rand = "0.10.1"

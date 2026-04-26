@@ -9,9 +9,12 @@ use crate::util::{decode_value, read_i32, read_u32, read_u64, write_i32, write_u
 pub struct Wal {
     path: PathBuf,
     writer: BufWriter<File>,
+    buffered_bytes: usize,
 }
 
 impl Wal {
+    const FLUSH_BYTES: usize = 64 * 1024;
+
     pub fn open(dir: &Path) -> Result<Self> {
         let path = dir.join("current.wal");
         let file = OpenOptions::new()
@@ -23,6 +26,7 @@ impl Wal {
         Ok(Self {
             path,
             writer: BufWriter::new(file),
+            buffered_bytes: 0,
         })
     }
 
@@ -38,7 +42,18 @@ impl Wal {
         if let ValueRef::Value(v) = &entry.value {
             self.writer.write_all(v)?;
         }
+
+        self.buffered_bytes += 8 + 4 + 4 + entry.key.len() + value_len.max(0) as usize;
+        if self.buffered_bytes >= Self::FLUSH_BYTES {
+            self.writer.flush()?;
+            self.buffered_bytes = 0;
+        }
+        Ok(())
+    }
+
+    pub fn flush(&mut self) -> Result<()> {
         self.writer.flush()?;
+        self.buffered_bytes = 0;
         Ok(())
     }
 
@@ -59,16 +74,36 @@ impl Wal {
                 Err(e) => return Err(e),
             };
 
-            let key_len = read_u32(&mut reader)? as usize;
-            let val_len = read_i32(&mut reader)?;
+            let key_len = match read_u32(&mut reader) {
+                Ok(v) => v as usize,
+                Err(crate::types::ForgeError::Io(err)) if err.kind() == ErrorKind::UnexpectedEof => {
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
+            let val_len = match read_i32(&mut reader) {
+                Ok(v) => v,
+                Err(crate::types::ForgeError::Io(err)) if err.kind() == ErrorKind::UnexpectedEof => {
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
 
             let mut key = vec![0u8; key_len];
-            reader.read_exact(&mut key)?;
+            match reader.read_exact(&mut key) {
+                Ok(()) => {}
+                Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+                Err(err) => return Err(err.into()),
+            }
 
             let mut value_bytes = Vec::new();
             if val_len > 0 {
                 value_bytes.resize(val_len as usize, 0);
-                reader.read_exact(&mut value_bytes)?;
+                match reader.read_exact(&mut value_bytes) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+                    Err(err) => return Err(err.into()),
+                }
             }
 
             let value = decode_value(val_len, value_bytes)?;
@@ -82,7 +117,7 @@ impl Wal {
     }
 
     pub fn reset(&mut self) -> Result<()> {
-        self.writer.flush()?;
+        self.flush()?;
         let mut file = OpenOptions::new().write(true).open(&self.path)?;
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
@@ -94,6 +129,7 @@ impl Wal {
                 .append(true)
                 .open(&self.path)?,
         );
+        self.buffered_bytes = 0;
 
         Ok(())
     }

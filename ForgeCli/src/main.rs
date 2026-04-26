@@ -62,6 +62,22 @@ fn run_repl(initial_db_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
         let cmd = tokens[0].to_ascii_uppercase();
         match cmd.as_str() {
+            "TEST" => {
+                let start = std::time::Instant::now();
+                if tokens.len() < 2 {
+                    eprintln!("usage: TEST <number of entries>");
+                    continue;
+                }
+
+                let num = tokens[1].parse::<usize>()?;
+
+                for i in 0..num {
+                    let random_number = rand::random::<u32>();
+                    db.put(i.to_string(), random_number.to_string().into_bytes())?;
+                }
+                let finish = std::time::Instant::now() - start;
+                println!("finished in {}ms", finish.as_millis());
+            }
             "PUT" => {
                 if tokens.len() < 3 {
                     eprintln!("usage: PUT <key> <value>");

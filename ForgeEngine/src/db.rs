@@ -1,16 +1,16 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::compaction::merge_for_compaction;
+use crate::compaction::{CompactionIterator, DbIterator, MergeIterator, TableIterator};
 use crate::manifest::{Manifest, TableMeta};
 use crate::memtable::MemTable;
 use crate::sstable::{reader, writer};
 use crate::types::{Entry, Result, ValueRef};
 use crate::wal::Wal;
 
-const DEFAULT_MEMTABLE_LIMIT_BYTES: usize = 64 * 1024;
+const DEFAULT_MEMTABLE_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LEVEL: usize = 3;
-const LEVEL_COMPACTION_THRESHOLD: [usize; MAX_LEVEL + 1] = [4, 4, 4, usize::MAX];
+const LEVEL_COMPACTION_THRESHOLD: [usize; MAX_LEVEL + 1] = [16, 16, 16, usize::MAX];
 
 #[derive(Debug)]
 pub struct Db {
@@ -125,6 +125,8 @@ impl Db {
             return Ok(());
         }
 
+        self.wal.flush()?;
+
         let id = self.next_table_id;
         self.next_table_id += 1;
         let meta = TableMeta::new(&self.dir, id, 0);
@@ -157,30 +159,28 @@ impl Db {
     fn compact_level_into_next(&mut self, level: usize) -> Result<()> {
         let next_level = level + 1;
 
-        let mut all_records = Vec::new();
+        let mut table_iters: Vec<Box<dyn DbIterator>> = Vec::new();
 
         for t in &self.levels[next_level] {
-            for entry in reader::read_all(&t.data_path)? {
-                all_records.push((entry.key, entry.seq, entry.value));
-            }
+            table_iters.push(Box::new(TableIterator::open(&t.data_path)?));
         }
 
         for t in &self.levels[level] {
-            for entry in reader::read_all(&t.data_path)? {
-                all_records.push((entry.key, entry.seq, entry.value));
-            }
+            table_iters.push(Box::new(TableIterator::open(&t.data_path)?));
         }
 
-        let merged = merge_for_compaction(all_records);
+        let merge_iter = MergeIterator::new(table_iters);
+        let mut compaction_iter = CompactionIterator::new(merge_iter);
 
         let id = self.next_table_id;
         self.next_table_id += 1;
         let output = TableMeta::new(&self.dir, id, next_level as u8);
 
-        let compacted: Vec<Entry> = merged
-            .into_iter()
-            .map(|(key, (seq, value))| Entry { key, seq, value })
-            .collect();
+        let mut compacted = Vec::new();
+        while compaction_iter.valid() {
+            compacted.push(compaction_iter.value().clone());
+            compaction_iter.next();
+        }
 
         writer::write_sstable(&output.data_path, &output.index_path, &compacted, 32)?;
 
