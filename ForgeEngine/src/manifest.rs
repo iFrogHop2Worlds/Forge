@@ -4,6 +4,20 @@ use std::path::{Path, PathBuf};
 
 use crate::types::{ForgeError, Result};
 
+/// Represents the metadata for a table, including its unique identifier,
+/// storage paths, and hierarchical level.
+///
+/// # Fields
+///
+/// * `id` - A 64-bit unsigned integer that uniquely identifies the table.
+/// * `level` - An 8-bit unsigned integer representing the table's hierarchical
+///   level, which may be used to organize tables within a multilevel structure.
+/// * `data_path` - A `PathBuf` that specifies the file system path to the table's data.
+/// * `index_path` - A `PathBuf` that specifies the file system path to the table's index.
+///
+/// This struct derives the following traits:
+/// * `Debug` - Enables formatting the struct using the `{:?}` formatter.
+/// * `Clone` - Allows for the creation of deep copies of the struct.
 #[derive(Debug, Clone)]
 pub struct TableMeta {
     pub id: u64,
@@ -13,6 +27,20 @@ pub struct TableMeta {
 }
 
 impl TableMeta {
+    /// Creates table metadata for a specific table ID and level.
+    ///
+    /// # Parameters
+    /// - `base_dir`: The database directory where the table files are stored.
+    /// - `id`: The unique table identifier.
+    /// - `level`: The level where the table belongs in the LSM-tree.
+    ///
+    /// # Returns
+    /// - `Self`: Returns a `TableMeta` with the data and index paths derived from
+    ///   the provided base directory, level, and table ID.
+    ///
+    /// # Behavior
+    /// - Creates an SSTable data path using the `L<level>_<id>.sst` naming format.
+    /// - Creates a sparse index path using the `L<level>_<id>.idx` naming format.
     pub fn new(base_dir: &Path, id: u64, level: u8) -> Self {
         Self {
             id,
@@ -23,6 +51,24 @@ impl TableMeta {
     }
 }
 
+/// Represents the persisted table layout for the database.
+///
+/// # Fields
+///
+/// * `next_table_id` - The next table identifier to assign when a new SSTable is
+///   created.
+/// * `levels` - The list of table metadata grouped by level in the LSM-tree.
+///
+/// # Behavior
+///
+/// - The manifest records enough metadata to reopen the database without scanning
+///   every table file during normal startup.
+/// - The manifest file stores the next table ID and the table IDs present at each
+///   level.
+///
+/// # Notes
+///
+/// - Table metadata is sorted by descending table ID after loading.
 #[derive(Debug, Clone)]
 pub struct Manifest {
     pub next_table_id: u64,
@@ -30,6 +76,17 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    /// Creates an empty manifest with the requested number of levels.
+    ///
+    /// # Parameters
+    /// - `level_count`: The number of levels to allocate in the manifest.
+    ///
+    /// # Returns
+    /// - `Self`: Returns a manifest with no tables and a `next_table_id` of `1`.
+    ///
+    /// # Behavior
+    /// - Allocates one empty table list for each level.
+    /// - Initializes table ID assignment at `1`.
     pub fn empty(level_count: usize) -> Self {
         Self {
             next_table_id: 1,
@@ -37,6 +94,28 @@ impl Manifest {
         }
     }
 
+    /// Loads the manifest file from a database directory.
+    ///
+    /// # Parameters
+    /// - `base_dir`: The database directory containing the `MANIFEST` file.
+    /// - `level_count`: The number of levels expected by the database.
+    ///
+    /// # Returns
+    /// - `Result<Option<Self>>`: Returns `Ok(Some(Manifest))` when a manifest is
+    ///   found and decoded, `Ok(None)` when no manifest exists, or an error if the
+    ///   manifest cannot be read or parsed.
+    ///
+    /// # Behavior
+    /// - Reads the `MANIFEST` file line by line.
+    /// - Parses `NEXT <id>` records to restore the next table ID.
+    /// - Parses `TABLE <level> <id>` records to restore table metadata.
+    /// - Sorts each level by descending table ID after loading.
+    ///
+    /// # Errors
+    /// - Returns an error if the manifest file cannot be opened or read.
+    /// - Returns a corruption error if a manifest record is missing required fields,
+    ///   contains invalid numbers, uses an unknown tag, or references an out-of-range
+    ///   level.
     pub fn load(base_dir: &Path, level_count: usize) -> Result<Option<Self>> {
         let path = base_dir.join("MANIFEST");
         if !path.exists() {
@@ -60,32 +139,48 @@ impl Manifest {
                 "NEXT" => {
                     let id = parts
                         .next()
-                        .ok_or_else(|| ForgeError::Corruption("manifest NEXT missing id".to_string()))?
+                        .ok_or_else(|| {
+                            ForgeError::Corruption("manifest NEXT missing id".to_string())
+                        })?
                         .parse::<u64>()
-                        .map_err(|_| ForgeError::Corruption("manifest NEXT invalid id".to_string()))?;
+                        .map_err(|_| {
+                            ForgeError::Corruption("manifest NEXT invalid id".to_string())
+                        })?;
                     manifest.next_table_id = id.max(1);
                 }
                 "TABLE" => {
                     let level = parts
                         .next()
-                        .ok_or_else(|| ForgeError::Corruption("manifest TABLE missing level".to_string()))?
+                        .ok_or_else(|| {
+                            ForgeError::Corruption("manifest TABLE missing level".to_string())
+                        })?
                         .parse::<usize>()
-                        .map_err(|_| ForgeError::Corruption("manifest TABLE invalid level".to_string()))?;
+                        .map_err(|_| {
+                            ForgeError::Corruption("manifest TABLE invalid level".to_string())
+                        })?;
                     let id = parts
                         .next()
-                        .ok_or_else(|| ForgeError::Corruption("manifest TABLE missing id".to_string()))?
+                        .ok_or_else(|| {
+                            ForgeError::Corruption("manifest TABLE missing id".to_string())
+                        })?
                         .parse::<u64>()
-                        .map_err(|_| ForgeError::Corruption("manifest TABLE invalid id".to_string()))?;
+                        .map_err(|_| {
+                            ForgeError::Corruption("manifest TABLE invalid id".to_string())
+                        })?;
 
                     if level >= level_count {
-                        return Err(ForgeError::Corruption("manifest TABLE level out of range".to_string()));
+                        return Err(ForgeError::Corruption(
+                            "manifest TABLE level out of range".to_string(),
+                        ));
                     }
 
                     let table = TableMeta::new(base_dir, id, level as u8);
                     manifest.levels[level].push(table);
                 }
                 _ => {
-                    return Err(ForgeError::Corruption(format!("manifest unknown tag: {tag}")));
+                    return Err(ForgeError::Corruption(format!(
+                        "manifest unknown tag: {tag}"
+                    )));
                 }
             }
         }
@@ -101,6 +196,27 @@ impl Manifest {
         Ok(Some(manifest))
     }
 
+    /// Saves the manifest to a database directory.
+    ///
+    /// # Parameters
+    /// - `base_dir`: The database directory where the `MANIFEST` file will be stored.
+    ///
+    /// # Returns
+    /// - `Result<()>`: Returns `Ok(())` when the manifest is saved, or an error if
+    ///   the file cannot be written or replaced.
+    ///
+    /// # Behavior
+    /// - Ensures the database directory exists.
+    /// - Writes the manifest contents to `MANIFEST.tmp`.
+    /// - Replaces the existing `MANIFEST` file with the completed temporary file.
+    /// - Writes one `NEXT` record followed by one `TABLE` record per table.
+    ///
+    /// # Errors
+    /// - Returns an error if the directory cannot be created.
+    /// - Returns an error if the temporary manifest cannot be created, written, or
+    ///   flushed.
+    /// - Returns an error if the old manifest cannot be removed or the temporary file
+    ///   cannot be renamed into place.
     pub fn save(&self, base_dir: &Path) -> Result<()> {
         fs::create_dir_all(base_dir)?;
         let tmp = base_dir.join("MANIFEST.tmp");

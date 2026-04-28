@@ -53,7 +53,9 @@ pub fn decode_value(len: i32, bytes: Vec<u8>) -> Result<ValueRef> {
     }
 
     if len < -1 {
-        return Err(ForgeError::Corruption("invalid negative value length".to_string()));
+        return Err(ForgeError::Corruption(
+            "invalid negative value length".to_string(),
+        ));
     }
 
     Ok(ValueRef::Value(bytes))

@@ -1,7 +1,33 @@
 use crate::types::{Entry, Result, ValueRef};
-use crate::util::{decode_value, encode_value_len, read_i32, read_u32, read_u64, write_i32, write_u32, write_u64};
+use crate::util::{
+    decode_value, encode_value_len, read_i32, read_u32, read_u64, write_i32, write_u32, write_u64,
+};
 use std::io::{Read, Write};
 
+/// Writes a single SSTable entry to the provided output stream.
+///
+/// # Parameters
+/// - `w`: The output stream that receives the encoded entry bytes.
+/// - `entry`: The `Entry` object containing the sequence number, key, and value
+///   or tombstone marker to write.
+///
+/// # Returns
+/// - `Result<usize>`: Returns the number of bytes written on success, or an error
+///   if writing to the stream fails.
+///
+/// # Behavior
+/// - Writes the entry sequence number as a `u64`.
+/// - Writes the key length as a `u32`.
+/// - Writes the encoded value length as an `i32`, where tombstones are represented
+///   by a negative length.
+/// - Writes the UTF-8 key bytes followed by value bytes when the entry contains a value.
+///
+/// # Errors
+/// - Returns an error if any field cannot be written to the output stream.
+///
+/// # Notes
+/// - This function does not sort or validate entry ordering. Callers are responsible
+///   for writing entries in SSTable order.
 pub fn write_entry(mut w: impl Write, entry: &Entry) -> Result<usize> {
     write_u64(&mut w, entry.seq)?;
     write_u32(&mut w, entry.key.len() as u32)?;
@@ -16,6 +42,25 @@ pub fn write_entry(mut w: impl Write, entry: &Entry) -> Result<usize> {
     Ok(bytes)
 }
 
+/// Reads a single SSTable entry from the provided input stream.
+///
+/// # Parameters
+/// - `r`: The input stream containing an encoded SSTable entry.
+///
+/// # Returns
+/// - `Result<Entry>`: Returns the decoded `Entry` on success, or an error if the
+///   entry cannot be read or decoded.
+///
+/// # Behavior
+/// - Reads the sequence number, key length, and encoded value length from the stream.
+/// - Reads the key bytes and converts them into a UTF-8 `String`.
+/// - Reads value bytes when the encoded value length is positive.
+/// - Decodes the value bytes into either `ValueRef::Value` or `ValueRef::Tombstone`.
+///
+/// # Errors
+/// - Returns an I/O error if the stream ends before a complete entry is read.
+/// - Returns a corruption error if the key is not valid UTF-8 or the value length
+///   cannot be decoded.
 pub fn read_entry(mut r: impl Read) -> Result<Entry> {
     let seq = read_u64(&mut r)?;
     let key_len = read_u32(&mut r)? as usize;

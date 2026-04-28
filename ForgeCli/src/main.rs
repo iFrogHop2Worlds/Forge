@@ -73,7 +73,34 @@ fn run_repl(initial_db_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
                 for i in 0..num {
                     let random_number = rand::random::<u32>();
-                    db.put(i.to_string(), random_number.to_string().into_bytes())?;
+                    let person = {
+                        let name = format!("Person{}", i);
+                        let age = random_number % 100;
+                        let location = "ca";
+                        let person = format!(
+                            "{{\"name\": \"{}\", \"age\": {}, \"location\": \"{}\"}}",
+                            name, age, location
+                        );
+                        person
+                    };
+                    db.put(i.to_string(), person.into_bytes())?;
+                }
+                let finish = std::time::Instant::now() - start;
+                println!("finished in {}ms", finish.as_millis());
+            }
+            "TEST2" => {
+                let start = std::time::Instant::now();
+                if tokens.len() < 2 {
+                    eprintln!("usage: TEST <number of entries>");
+                    continue;
+                }
+
+                let num = tokens[1].parse::<usize>()?;
+
+                for i in 0..num {
+                    let random_number = rand::random::<u32>().to_string().into_bytes();
+                    db.put(i.to_string(), &*random_number)?;
+                    db.put((num + i).to_string(), random_number)?;
                 }
                 let finish = std::time::Instant::now() - start;
                 println!("finished in {}ms", finish.as_millis());
