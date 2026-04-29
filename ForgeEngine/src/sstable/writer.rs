@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufWriter, Seek, Write};
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use crate::sstable::block::write_entry;
@@ -58,15 +58,15 @@ pub fn write_sstable(
     index_stride: usize,
 ) -> Result<()> {
     let file = File::create(path)?;
-    let mut writer = BufWriter::new(file);
+    let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
 
-    let mut sparse = Vec::new();
+    let mut offset = 0u64;
+    let mut sparse = Vec::with_capacity(entries.len().div_ceil(index_stride.max(1)));
     for (i, entry) in entries.iter().enumerate() {
-        let offset = writer.stream_position()?;
         if i % index_stride.max(1) == 0 {
             sparse.push((entry.key.clone(), offset));
         }
-        write_entry(&mut writer, entry)?;
+        offset += write_entry(&mut writer, entry)? as u64;
     }
 
     writer.flush()?;

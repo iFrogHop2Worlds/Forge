@@ -10,7 +10,8 @@ use crate::wal::Wal;
 
 const DEFAULT_MEMTABLE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_LEVEL: usize = 9;
-const LEVEL_COMPACTION_THRESHOLD: [usize; MAX_LEVEL + 1] = [9, 9, 9, 9, 9, 9, 9, 9, 9, usize::MAX];
+const LEVEL_COMPACTION_THRESHOLD: [usize; MAX_LEVEL + 1] =
+    [16, 10, 10, 10, 10, 10, 10, 10, 10, usize::MAX];
 
 /// The core structure of the Forge data engine
 /// This struct is the backbone of a log structured merge tree (LSM-tree) based engine,

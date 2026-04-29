@@ -28,7 +28,8 @@ pub struct Wal {
 }
 
 impl Wal {
-    const FLUSH_BYTES: usize = 124 * 1024 * 1024;
+    const BUFFER_BYTES: usize = 8 * 1024 * 1024;
+    const FLUSH_BYTES: usize = 256 * 1024 * 1024;
 
     /// Opens the active WAL file in the specified database directory.
     ///
@@ -56,7 +57,7 @@ impl Wal {
 
         Ok(Self {
             path,
-            writer: BufWriter::new(file),
+            writer: BufWriter::with_capacity(Self::BUFFER_BYTES, file),
             buffered_bytes: 0,
         })
     }
@@ -222,7 +223,8 @@ impl Wal {
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
 
-        self.writer = BufWriter::new(
+        self.writer = BufWriter::with_capacity(
+            Self::BUFFER_BYTES,
             OpenOptions::new()
                 .create(true)
                 .read(true)

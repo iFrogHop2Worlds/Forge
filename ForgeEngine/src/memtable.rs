@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 
 use crate::types::ValueRef;
 
@@ -60,15 +61,20 @@ impl MemTable {
                 ValueRef::Tombstone => 0,
             };
 
-        if let Some((_, old_value)) = self.map.insert(key.clone(), (seq, value)) {
-            self.approx_bytes = self.approx_bytes.saturating_sub(
-                key.len()
-                    + match old_value {
+        match self.map.entry(key) {
+            Entry::Occupied(mut occupied) => {
+                let old_size = occupied.key().len()
+                    + match &occupied.get().1 {
                         ValueRef::Value(v) => v.len(),
                         ValueRef::Tombstone => 0,
-                    },
-            );
-        }
+                    };
+                self.approx_bytes = self.approx_bytes.saturating_sub(old_size);
+                occupied.insert((seq, value));
+            }
+            Entry::Vacant(vacant) => {
+                vacant.insert((seq, value));
+            }
+        };
 
         self.approx_bytes += new_size;
     }
