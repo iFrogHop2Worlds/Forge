@@ -290,17 +290,16 @@ impl Db {
         Ok(None)
     }
 
-    /// Flushes the current in-memory memtable to persistent storage by writing it to a new SSTable
-    /// and updates the associated metadata and indices.
+    /// Flushes the current in-memory memtable to persistent storage by streaming it to a new
+    /// SSTable and updating the associated metadata and indices.
     ///
     /// # Workflow
     /// 1. Checks if the memtable is empty; if so, the function returns `Ok(())` without taking any action.
     /// 2. Flushes the Write-Ahead Log (WAL) to ensure all operations in the log are safely persisted.
     /// 3. Generates a new table ID and creates metadata for the new SSTable.
-    /// 4. Transforms the sorted data in the memtable into a vector of `Entry` objects, which are the
-    ///    building blocks of the SSTable.
-    /// 5. Calls the `writer::write_sstable` function to write the data to the disk, creating both
-    ///    the data file and the index file for the new SSTable.
+    /// 4. Streams borrowed entries from the memtable in sorted key order.
+    /// 5. Calls the `writer::write_sstable_refs` function to write the borrowed entries to disk,
+    ///    creating both the data file and the index file for the new SSTable.
     /// 6. Updates the metadata for level 0 of the storage hierarchy to include the newly created SSTable.
     /// 7. Persists the updated manifest file containing the storage system's structure.
     /// 8. Clears the in-memory memtable, resetting its state for future use.
@@ -314,7 +313,7 @@ impl Db {
     /// # Errors
     /// This function can return an `Err` in the following conditions:
     /// * If flushing the WAL fails.
-    /// * If writing the data to the SSTable (or index file) fails.
+    /// * If streaming the borrowed memtable entries to the SSTable or index file fails.
     /// * If persisting the manifest fails.
     /// * If an issue occurs during memtable clearance or WAL reset.
     ///
@@ -332,13 +331,12 @@ impl Db {
         self.next_table_id += 1;
         let meta = TableMeta::new(&self.dir, id, 0);
 
-        let entries: Vec<Entry> = self
-            .memtable
-            .iter_sorted()
-            .map(|(k, seq, value)| Entry { key: k, value, seq })
-            .collect();
-
-        writer::write_sstable(&meta.data_path, &meta.index_path, &entries, 16)?;
+        writer::write_sstable_refs(
+            &meta.data_path,
+            &meta.index_path,
+            self.memtable.iter_sorted_ref(),
+            16,
+        )?;
         self.levels[0].insert(0, meta);
         self.persist_manifest()?;
 

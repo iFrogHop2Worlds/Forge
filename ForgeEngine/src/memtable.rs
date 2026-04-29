@@ -135,14 +135,33 @@ impl MemTable {
     ///
     /// # Behavior
     /// - Uses the natural ordering of the underlying `BTreeMap`.
-    /// - Clones keys and value states so the iterator output can be collected into
-    ///   SSTable entries.
+    /// - Clones keys and value states so the iterator output can be used where
+    ///   owned entries are required.
     ///
     /// # Notes
-    /// - This iterator is used when flushing the memtable to an SSTable.
+    /// - Flush paths that can write borrowed entries should prefer `iter_sorted_ref`
+    ///   to avoid cloning keys and values.
     pub fn iter_sorted(&self) -> impl Iterator<Item = (String, u64, ValueRef)> + '_ {
         self.map
             .iter()
             .map(|(k, (seq, value))| (k.clone(), *seq, value.clone()))
+    }
+
+    /// Iterates over borrowed memtable entries in sorted key order.
+    ///
+    /// # Returns
+    /// - `impl Iterator<Item = (&String, u64, &ValueRef)>`: An iterator yielding
+    ///   borrowed keys, sequence numbers, and borrowed value states in ascending
+    ///   key order.
+    ///
+    /// # Behavior
+    /// - Uses the natural ordering of the underlying `BTreeMap`.
+    /// - Avoids cloning keys and values while the memtable is being flushed.
+    ///
+    /// # Notes
+    /// - This iterator is intended for streaming encoders that do not need owned
+    ///   `Entry` values.
+    pub fn iter_sorted_ref(&self) -> impl Iterator<Item = (&String, u64, &ValueRef)> + '_ {
+        self.map.iter().map(|(k, (seq, value))| (k, *seq, value))
     }
 }

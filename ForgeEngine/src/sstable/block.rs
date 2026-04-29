@@ -29,16 +29,39 @@ use std::io::{Read, Write};
 /// - This function does not sort or validate entry ordering. Callers are responsible
 ///   for writing entries in SSTable order.
 pub fn write_entry(mut w: impl Write, entry: &Entry) -> Result<usize> {
-    write_u64(&mut w, entry.seq)?;
-    write_u32(&mut w, entry.key.len() as u32)?;
-    let val_len = encode_value_len(&entry.value);
+    write_entry_ref(&mut w, entry.seq, &entry.key, &entry.value)
+}
+
+/// Writes a single borrowed SSTable entry to the provided output stream.
+///
+/// # Parameters
+/// - `w`: The output stream that receives the encoded entry bytes.
+/// - `seq`: The sequence number for the entry.
+/// - `key`: The borrowed key string to write.
+/// - `value`: The borrowed value or tombstone marker to write.
+///
+/// # Returns
+/// - `Result<usize>`: Returns the number of bytes written on success, or an error
+///   if writing to the stream fails.
+///
+/// # Behavior
+/// - Writes the same binary entry format as `write_entry`.
+/// - Avoids constructing or cloning an owned `Entry` when the caller already has
+///   borrowed entry fields.
+///
+/// # Errors
+/// - Returns an error if any field cannot be written to the output stream.
+pub fn write_entry_ref(mut w: impl Write, seq: u64, key: &str, value: &ValueRef) -> Result<usize> {
+    write_u64(&mut w, seq)?;
+    write_u32(&mut w, key.len() as u32)?;
+    let val_len = encode_value_len(value);
     write_i32(&mut w, val_len)?;
-    w.write_all(entry.key.as_bytes())?;
-    if let ValueRef::Value(v) = &entry.value {
+    w.write_all(key.as_bytes())?;
+    if let ValueRef::Value(v) = value {
         w.write_all(v)?;
     }
 
-    let bytes = 8 + 4 + 4 + entry.key.len() + if val_len > 0 { val_len as usize } else { 0 };
+    let bytes = 8 + 4 + 4 + key.len() + if val_len > 0 { val_len as usize } else { 0 };
     Ok(bytes)
 }
 

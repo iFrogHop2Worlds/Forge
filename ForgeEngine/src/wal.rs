@@ -29,7 +29,7 @@ pub struct Wal {
 
 impl Wal {
     const BUFFER_BYTES: usize = 8 * 1024 * 1024;
-    const FLUSH_BYTES: usize = 256 * 1024 * 1024;
+    const FLUSH_BYTES: usize = 8 * 1024 * 1024;
 
     /// Opens the active WAL file in the specified database directory.
     ///
