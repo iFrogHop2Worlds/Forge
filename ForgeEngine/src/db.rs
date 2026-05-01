@@ -258,7 +258,8 @@ impl Db {
     ///      or has been logically deleted (`ValueRef::Tombstone`).
     /// 2. If the key is not present in the `memtable`, it scans the cached on-disk levels.
     ///    - Each level is searched sequentially using the in-memory `TableCache` entries loaded at startup.
-    ///    - Each table cache provides a cached bloom filter, sparse index, and an open SSTable handle clone.
+    ///    - Each table cache provides a cached bloom filter, sparse index, optional block index, and an open SSTable handle clone.
+    ///    - When a block index is present, the read path searches a single fixed-size block first and falls back to the sparse index path for older tables.
     ///    - If the key is located in these tables, the function behaves similarly to the `memtable`
     ///      lookup, differentiating based on `ValueRef`.
     /// 3. If the key is not found in either the `memtable` or the on-disk tables, the function
@@ -345,6 +346,7 @@ impl Db {
         writer::write_sstable_refs(
             &meta.data_path,
             &meta.index_path,
+            &meta.block_index_path,
             &meta.bloom_path,
             self.bloom_config,
             self.memtable.iter_sorted_ref(),
@@ -472,6 +474,7 @@ impl Db {
         writer::write_sstable(
             &output.data_path,
             &output.index_path,
+            &output.block_index_path,
             &output.bloom_path,
             self.bloom_config,
             &compacted,
@@ -489,6 +492,8 @@ impl Db {
         {
             let _ = fs::remove_file(old.data_path);
             let _ = fs::remove_file(old.index_path);
+            let _ = fs::remove_file(old.block_index_path);
+            let _ = fs::remove_file(old.bloom_path);
         }
 
         self.levels[next_level].push(output);
@@ -535,11 +540,16 @@ impl Db {
         for level in levels {
             let mut cached_level = Vec::with_capacity(level.len());
             for table in level {
-                cached_level.push(TableCache::load(
-                    &table.data_path,
-                    &table.index_path,
-                    &table.bloom_path,
-                )?);
+                cached_level.push(if table.block_index_path.exists() {
+                    TableCache::load_with_block_index(
+                        &table.data_path,
+                        &table.block_index_path,
+                        &table.index_path,
+                        &table.bloom_path,
+                    )?
+                } else {
+                    TableCache::load(&table.data_path, &table.index_path, &table.bloom_path)?
+                });
             }
             out.push(cached_level);
         }

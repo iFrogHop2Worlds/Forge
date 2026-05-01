@@ -4,17 +4,20 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use crate::sstable::bloom::{BloomConfig, BloomFilter};
+use crate::sstable::block_index::{BlockIndex, BlockIndexEntry};
 use crate::sstable::block::{write_entry, write_entry_ref};
 use crate::sstable::index::SparseIndex;
 use crate::types::{Entry, Result, ValueRef};
 
 const SSTABLE_WRITE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+const BLOCK_TARGET_BYTES: usize = 4096;
 
-/// Writes a sorted string table (SSTable), bloom filter, and sparse index to disk.
+/// Writes a sorted string table (SSTable), block index, bloom filter, and sparse index to disk.
 ///
 /// # Parameters
 /// - `path`: The file path where the SSTable will be written.
 /// - `index_path`: The file path where the sparse index will be stored.
+/// - `block_index_path`: The file path where the block index will be stored.
 /// - `bloom_path`: The file path where the bloom filter will be stored.
 /// - `entries`: A slice of `Entry` objects representing key-value pairs to be written to the SSTable.
 /// - `index_stride`: The interval for including entries in the sparse index. For example, if `index_stride`
@@ -25,9 +28,10 @@ const SSTABLE_WRITE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 ///
 /// # Behavior
 /// - The function streams the key-value pairs from `entries` to the SSTable file specified in `path`.
-/// - As it writes the SSTable, it records sparse index points at intervals defined by `index_stride`. Each
-///   sparse index point consists of a key and its byte offset in the SSTable file.
-/// - The bloom filter and sparse index are then written to their companion files.
+/// - Entries are grouped into approximately `BLOCK_TARGET_BYTES` blocks while writing, and each block
+///   records its first key, byte offset, encoded byte length, and entry count.
+/// - As it writes the SSTable, it also records sparse index points at intervals defined by `index_stride`.
+/// - The block index, bloom filter, and sparse index are then written to their companion files.
 ///
 /// # Errors
 /// - Returns an error if there is an issue creating or writing to the SSTable or index files.
@@ -56,6 +60,7 @@ const SSTABLE_WRITE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 /// # Notes
 /// - This function assumes that the entries are already sorted by their keys.
 /// - `index_stride` must be greater than 0; otherwise, the sparse index would not be properly generated.
+/// - The block size target is fixed at roughly 4 KiB for now; this is the boundary to refine before adding LRU caching.
 /// - This function delegates to the shared streaming writer used by iterator-based SSTable writes.
 ///
 /// # Dependencies
@@ -65,6 +70,7 @@ const SSTABLE_WRITE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 pub fn write_sstable(
     path: &Path,
     index_path: &Path,
+    block_index_path: &Path,
     bloom_path: &Path,
     bloom_config: BloomConfig,
     entries: &[Entry],
@@ -73,6 +79,7 @@ pub fn write_sstable(
     write_sstable_entries(
         path,
         index_path,
+        block_index_path,
         bloom_path,
         bloom_config,
         entries.iter(),
@@ -81,11 +88,12 @@ pub fn write_sstable(
     )
 }
 
-/// Writes a sorted string table (SSTable) from an entry iterator and its associated bloom filter and sparse index to disk.
+/// Writes a sorted string table (SSTable) from an entry iterator and its associated block index, bloom filter, and sparse index to disk.
 ///
 /// # Parameters
 /// - `path`: The file path where the SSTable will be written.
 /// - `index_path`: The file path where the sparse index will be stored.
+/// - `block_index_path`: The file path where the block index will be stored.
 /// - `bloom_path`: The file path where the bloom filter will be stored.
 /// - `entries`: An iterator of `Entry` objects representing sorted key-value pairs to write.
 /// - `index_stride`: The interval for including entries in the sparse index.
@@ -96,7 +104,7 @@ pub fn write_sstable(
 /// # Behavior
 /// - Streams entries directly from the iterator into the SSTable file.
 /// - Tracks byte offsets as entries are written instead of seeking for the current file position.
-/// - Builds and persists the sparse index after the data file is flushed.
+/// - Builds and persists the block index, bloom filter, and sparse index after the data file is flushed.
 ///
 /// # Errors
 /// - Returns an error if the SSTable or index file cannot be created or written.
@@ -107,6 +115,7 @@ pub fn write_sstable(
 pub fn write_sstable_iter<I>(
     path: &Path,
     index_path: &Path,
+    block_index_path: &Path,
     bloom_path: &Path,
     bloom_config: BloomConfig,
     entries: I,
@@ -115,14 +124,24 @@ pub fn write_sstable_iter<I>(
 where
     I: IntoIterator<Item = Entry>,
 {
-    write_sstable_entries(path, index_path, bloom_path, bloom_config, entries, index_stride, None)
+    write_sstable_entries(
+        path,
+        index_path,
+        block_index_path,
+        bloom_path,
+        bloom_config,
+        entries,
+        index_stride,
+        None,
+    )
 }
 
-/// Writes a sorted string table (SSTable) from borrowed entry fields and its associated bloom filter and sparse index to disk.
+/// Writes a sorted string table (SSTable) from borrowed entry fields and its associated block index, bloom filter, and sparse index to disk.
 ///
 /// # Parameters
 /// - `path`: The file path where the SSTable will be written.
 /// - `index_path`: The file path where the sparse index will be stored.
+/// - `block_index_path`: The file path where the block index will be stored.
 /// - `bloom_path`: The file path where the bloom filter will be stored.
 /// - `entries`: An iterator of borrowed entry fields in sorted key order.
 /// - `index_stride`: The interval for including entries in the sparse index.
@@ -133,7 +152,7 @@ where
 /// # Behavior
 /// - Streams borrowed key/value fields directly into the SSTable file.
 /// - Avoids constructing owned `Entry` values during memtable flush.
-/// - Tracks byte offsets as entries are written and persists a sparse index.
+/// - Tracks byte offsets as entries are written and persists a block index plus the other lookup metadata.
 ///
 /// # Errors
 /// - Returns an error if the SSTable or index file cannot be created or written.
@@ -144,6 +163,7 @@ where
 pub fn write_sstable_refs<'a, I>(
     path: &Path,
     index_path: &Path,
+    block_index_path: &Path,
     bloom_path: &Path,
     bloom_config: BloomConfig,
     entries: I,
@@ -159,15 +179,49 @@ where
     let index_stride = index_stride.max(1);
     let mut bloom = BloomFilter::builder_with(bloom_config);
     let mut sparse = Vec::new();
+    let mut block_index = Vec::new();
+    let mut block_keys: Vec<String> = Vec::new();
+    let mut block_offset = 0u64;
+    let mut block_entry_count = 0u32;
+    let mut block_bytes = 0u32;
     for (i, (key, seq, value)) in entries.into_iter().enumerate() {
         bloom.insert(key);
+        if block_entry_count == 0 {
+            block_offset = offset;
+        }
+        let entry_bytes = write_entry_ref(&mut writer, seq, key, value)? as u64;
+        offset += entry_bytes;
+        block_bytes = block_bytes.saturating_add(entry_bytes as u32);
+        block_entry_count += 1;
+        block_keys.push(key.clone());
         if i % index_stride == 0 {
             sparse.push((key.clone(), offset));
         }
-        offset += write_entry_ref(&mut writer, seq, key, value)? as u64;
+
+        if block_bytes as usize >= BLOCK_TARGET_BYTES {
+            block_index.push(BlockIndexEntry {
+                first_key: block_keys.first().cloned().unwrap_or_default(),
+                offset: block_offset,
+                entry_count: block_entry_count,
+                byte_len: block_bytes,
+            });
+            block_keys.clear();
+            block_entry_count = 0;
+            block_bytes = 0;
+        }
+    }
+
+    if block_entry_count > 0 {
+        block_index.push(BlockIndexEntry {
+            first_key: block_keys.first().cloned().unwrap_or_default(),
+            offset: block_offset,
+            entry_count: block_entry_count,
+            byte_len: block_bytes,
+        });
     }
 
     writer.flush()?;
+    BlockIndex::new(BLOCK_TARGET_BYTES as u32, block_index).save(block_index_path)?;
     bloom.finish().save(bloom_path)?;
     SparseIndex::new(sparse).save(index_path)?;
     Ok(())
@@ -176,6 +230,7 @@ where
 fn write_sstable_entries<I>(
     path: &Path,
     index_path: &Path,
+    block_index_path: &Path,
     bloom_path: &Path,
     bloom_config: BloomConfig,
     entries: I,
@@ -193,16 +248,50 @@ where
     let index_stride = index_stride.max(1);
     let mut bloom = BloomFilter::builder_with(bloom_config);
     let mut sparse = Vec::with_capacity(size_hint.map_or(0, |len| len.div_ceil(index_stride)));
+    let mut block_index = Vec::new();
+    let mut block_keys: Vec<String> = Vec::new();
+    let mut block_offset = 0u64;
+    let mut block_entry_count = 0u32;
+    let mut block_bytes = 0u32;
     for (i, entry) in entries.into_iter().enumerate() {
         let entry = entry.borrow();
         bloom.insert(&entry.key);
+        if block_entry_count == 0 {
+            block_offset = offset;
+        }
+        let entry_bytes = write_entry(&mut writer, entry)? as u64;
+        offset += entry_bytes;
+        block_bytes = block_bytes.saturating_add(entry_bytes as u32);
+        block_entry_count += 1;
+        block_keys.push(entry.key.clone());
         if i % index_stride == 0 {
             sparse.push((entry.key.clone(), offset));
         }
-        offset += write_entry(&mut writer, entry)? as u64;
+
+        if block_bytes as usize >= BLOCK_TARGET_BYTES {
+            block_index.push(BlockIndexEntry {
+                first_key: block_keys.first().cloned().unwrap_or_default(),
+                offset: block_offset,
+                entry_count: block_entry_count,
+                byte_len: block_bytes,
+            });
+            block_keys.clear();
+            block_entry_count = 0;
+            block_bytes = 0;
+        }
+    }
+
+    if block_entry_count > 0 {
+        block_index.push(BlockIndexEntry {
+            first_key: block_keys.first().cloned().unwrap_or_default(),
+            offset: block_offset,
+            entry_count: block_entry_count,
+            byte_len: block_bytes,
+        });
     }
 
     writer.flush()?;
+    BlockIndex::new(BLOCK_TARGET_BYTES as u32, block_index).save(block_index_path)?;
     bloom.finish().save(bloom_path)?;
     SparseIndex::new(sparse).save(index_path)?;
     Ok(())

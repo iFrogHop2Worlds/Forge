@@ -210,6 +210,10 @@ pub fn get_cached(table: &TableCache, key: &str) -> Result<Option<Entry>> {
         return Ok(None);
     }
 
+    if let Some(entry) = table.get_from_block_index(key)? {
+        return Ok(Some(entry));
+    }
+
     let mut reader = BufReader::new(table.try_clone_data_file()?);
     let start = table.index().floor_offset_for(key);
     reader.seek(SeekFrom::Start(start))?;

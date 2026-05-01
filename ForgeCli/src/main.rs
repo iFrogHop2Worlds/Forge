@@ -101,6 +101,8 @@ fn run_repl(initial_db_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                     use std::fmt::Write;
                     write!(&mut index_buffer, "{}", i).unwrap();
                     db.get(&index_buffer)?;
+                    // let v = db.get(&index_buffer)?;
+                    // println!("got value for key {}: {:?}", i, String::from_utf8_lossy(&v.unwrap()));
                 }
                 let finish = std::time::Instant::now() - start;
                 println!("finished in {}ms", finish.as_millis());
