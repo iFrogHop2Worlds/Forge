@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::path::Path;
-use std::{collections::HashMap, sync::Mutex};
+use std::{collections::{HashMap, VecDeque}, sync::Mutex};
 
 use crate::sstable::block_index::BlockIndex;
 use crate::sstable::bloom::BloomFilter;
@@ -12,14 +12,63 @@ use crate::types::{Entry, Result};
 /// # Behavior
 /// - Holds the bloom filter, sparse index, and optional block index in memory for the lifetime of the table cache.
 /// - Keeps one open data-file handle and clones it for reads so lookups do not reopen the file by path.
-/// - Caches decoded blocks so repeated reads can skip decompression and entry decoding.
+/// - Caches decoded blocks in a bounded LRU so repeated reads can skip decompression and entry decoding.
 #[derive(Debug)]
 pub struct TableCache {
     data_file: File,
     block_index: Option<BlockIndex>,
     bloom: BloomFilter,
     index: SparseIndex,
-    block_cache: Mutex<HashMap<u64, Vec<Entry>>>,
+    block_cache: Mutex<BlockCache>,
+}
+
+#[derive(Debug)]
+struct BlockCache {
+    map: HashMap<u64, Vec<Entry>>,
+    order: VecDeque<u64>,
+    capacity: usize,
+}
+
+impl BlockCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    fn get(&mut self, offset: u64) -> Option<Vec<Entry>> {
+        let value = self.map.get(&offset).cloned();
+        if value.is_some() {
+            self.touch(offset);
+        }
+        value
+    }
+
+    fn insert(&mut self, offset: u64, block: Vec<Entry>) {
+        if self.map.contains_key(&offset) {
+            self.map.insert(offset, block);
+            self.touch(offset);
+            return;
+        }
+
+        if self.map.len() >= self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.map.remove(&oldest);
+            }
+        }
+
+        self.order.push_back(offset);
+        self.map.insert(offset, block);
+    }
+
+    fn touch(&mut self, offset: u64) {
+        if let Some(pos) = self.order.iter().position(|&x| x == offset) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(offset);
+    }
 }
 
 impl TableCache {
@@ -34,7 +83,7 @@ impl TableCache {
             block_index: None,
             bloom: BloomFilter::load(bloom_path)?,
             index: SparseIndex::load(index_path)?,
-            block_cache: Mutex::new(HashMap::new()),
+            block_cache: Mutex::new(BlockCache::new(64)),
         })
     }
 
@@ -53,7 +102,7 @@ impl TableCache {
             block_index: Some(BlockIndex::load(block_index_path)?),
             bloom: BloomFilter::load(bloom_path)?,
             index: SparseIndex::load(index_path)?,
-            block_cache: Mutex::new(HashMap::new()),
+            block_cache: Mutex::new(BlockCache::new(64)),
         })
     }
 
@@ -82,17 +131,12 @@ impl TableCache {
 
     /// Returns a cached decoded block if available.
     pub fn cached_block(&self, offset: u64) -> Option<Vec<Entry>> {
-        self.block_cache.lock().ok().and_then(|cache| cache.get(&offset).cloned())
+        self.block_cache.lock().ok().and_then(|mut cache| cache.get(offset))
     }
 
     /// Stores a decoded block in the cache.
     pub fn insert_block_cache(&self, offset: u64, block: Vec<Entry>) {
         if let Ok(mut cache) = self.block_cache.lock() {
-            if cache.len() >= 64 {
-                if let Some(first) = cache.keys().next().copied() {
-                    cache.remove(&first);
-                }
-            }
             cache.insert(offset, block);
         }
     }
