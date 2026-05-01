@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{BufReader, ErrorKind, Seek, SeekFrom};
 use std::path::Path;
 
+use crate::sstable::bloom::BloomFilter;
 use crate::sstable::block::read_entry;
 use crate::sstable::index::SparseIndex;
 use crate::types::{Entry, Result};
@@ -145,11 +146,12 @@ pub fn read_all(path: &Path) -> Result<Vec<Entry>> {
     Ok(out)
 }
 
-/// Looks up a key in an SSTable using its sparse index.
+/// Looks up a key in an SSTable using its bloom filter and sparse index.
 ///
 /// # Parameters
 /// - `path`: The path to the SSTable data file.
 /// - `index_path`: The path to the sparse index file associated with the SSTable.
+/// - `bloom_path`: The path to the bloom filter file associated with the SSTable.
 /// - `key`: The key to search for.
 ///
 /// # Returns
@@ -158,7 +160,9 @@ pub fn read_all(path: &Path) -> Result<Vec<Entry>> {
 ///   be read.
 ///
 /// # Behavior
-/// - Loads the sparse index from `index_path`.
+/// - Loads the bloom filter from `bloom_path`.
+/// - Rejects the lookup immediately when the bloom filter says the key is definitely absent.
+/// - Loads the sparse index only when the bloom filter returns "maybe".
 /// - Seeks to the greatest indexed offset less than or equal to `key`.
 /// - Scans forward until the key is found, a greater key is encountered, or the
 ///   end of the SSTable is reached.
@@ -166,7 +170,12 @@ pub fn read_all(path: &Path) -> Result<Vec<Entry>> {
 /// # Errors
 /// - Returns an error if the index or SSTable file cannot be opened or read.
 /// - Returns an error if an entry or index record is malformed.
-pub fn get(path: &Path, index_path: &Path, key: &str) -> Result<Option<Entry>> {
+pub fn get(path: &Path, index_path: &Path, bloom_path: &Path, key: &str) -> Result<Option<Entry>> {
+    let bloom = BloomFilter::load(bloom_path)?;
+    if !bloom.might_contain(key) {
+        return Ok(None);
+    }
+
     let index = SparseIndex::load(index_path)?;
     let mut reader = BufReader::new(File::open(path)?);
     let start = index.floor_offset_for(key);

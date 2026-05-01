@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use crate::compaction::{CompactionIterator, DbIterator, MergeIterator, TableIterator};
 use crate::manifest::{Manifest, TableMeta};
 use crate::memtable::MemTable;
-use crate::sstable::{reader, writer};
+use crate::sstable::{bloom::BloomConfig, reader, writer};
 use crate::types::{Entry, Result, ValueRef};
 use crate::wal::Wal;
 
@@ -39,6 +39,7 @@ pub struct Db {
     next_seq: u64,
     next_table_id: u64,
     memtable_limit_bytes: usize,
+    bloom_config: BloomConfig,
 }
 
 impl Db {
@@ -123,7 +124,13 @@ impl Db {
             next_seq,
             next_table_id,
             memtable_limit_bytes: DEFAULT_MEMTABLE_LIMIT_BYTES,
+            bloom_config: BloomConfig::default(),
         })
+    }
+
+    /// Updates the bloom filter parameters used for future SSTable writes.
+    pub fn set_bloom_config(&mut self, config: BloomConfig) {
+        self.bloom_config = config;
     }
 
     /// Inserts a key-value pair into the database, assigning it a unique sequence number.
@@ -278,7 +285,7 @@ impl Db {
 
         for level in &self.levels {
             for t in level {
-                if let Some(entry) = reader::get(&t.data_path, &t.index_path, key)? {
+                if let Some(entry) = reader::get(&t.data_path, &t.index_path, &t.bloom_path, key)? {
                     return match entry.value {
                         ValueRef::Value(v) => Ok(Some(v)),
                         ValueRef::Tombstone => Ok(None),
@@ -334,6 +341,8 @@ impl Db {
         writer::write_sstable_refs(
             &meta.data_path,
             &meta.index_path,
+            &meta.bloom_path,
+            self.bloom_config,
             self.memtable.iter_sorted_ref(),
             16,
         )?;
@@ -455,7 +464,14 @@ impl Db {
             compaction_iter.next();
         }
 
-        writer::write_sstable(&output.data_path, &output.index_path, &compacted, 32)?;
+        writer::write_sstable(
+            &output.data_path,
+            &output.index_path,
+            &output.bloom_path,
+            self.bloom_config,
+            &compacted,
+            32,
+        )?;
 
         let old_level_tables: Vec<_> = self.levels[level].drain(..).collect();
         let old_next_level_tables: Vec<_> = self.levels[next_level].drain(..).collect();
@@ -487,6 +503,15 @@ impl Db {
     /// This function will return an error if the underlying `flush_memtable` operation fails.
     pub fn sync(&mut self) -> Result<()> {
         self.flush_memtable()
+    }
+
+    /// Closes the database by synchronizing any in-memory state before shutdown.
+    ///
+    /// # Returns
+    /// - `Result<()>`: Returns `Ok(())` when the database has been flushed and
+    ///   its state has been made durable, or an error if syncing fails.
+    pub fn close(mut self) -> Result<()> {
+        self.sync()
     }
 
     fn persist_manifest(&self) -> Result<()> {
@@ -584,5 +609,11 @@ impl Db {
 
         manifest.next_table_id = (max_id + 1).max(1);
         Ok(manifest)
+    }
+}
+
+impl Drop for Db {
+    fn drop(&mut self) {
+        let _ = self.sync();
     }
 }

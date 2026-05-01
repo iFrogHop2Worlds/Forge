@@ -14,6 +14,7 @@ use crate::types::{ForgeError, Result};
 ///   level, which may be used to organize tables within a multilevel structure.
 /// * `data_path` - A `PathBuf` that specifies the file system path to the table's data.
 /// * `index_path` - A `PathBuf` that specifies the file system path to the table's index.
+/// * `bloom_path` - A `PathBuf` that specifies the file system path to the table's bloom filter.
 ///
 /// This struct derives the following traits:
 /// * `Debug` - Enables formatting the struct using the `{:?}` formatter.
@@ -24,6 +25,7 @@ pub struct TableMeta {
     pub level: u8,
     pub data_path: PathBuf,
     pub index_path: PathBuf,
+    pub bloom_path: PathBuf,
 }
 
 impl TableMeta {
@@ -41,12 +43,14 @@ impl TableMeta {
     /// # Behavior
     /// - Creates an SSTable data path using the `L<level>_<id>.sst` naming format.
     /// - Creates a sparse index path using the `L<level>_<id>.idx` naming format.
+    /// - Creates a bloom filter path using the `L<level>_<id>.bf` naming format.
     pub fn new(base_dir: &Path, id: u64, level: u8) -> Self {
         Self {
             id,
             level,
             data_path: base_dir.join(format!("L{level}_{id}.sst")),
             index_path: base_dir.join(format!("L{level}_{id}.idx")),
+            bloom_path: base_dir.join(format!("L{level}_{id}.bf")),
         }
     }
 }

@@ -3,17 +3,19 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
+use crate::sstable::bloom::{BloomConfig, BloomFilter};
 use crate::sstable::block::{write_entry, write_entry_ref};
 use crate::sstable::index::SparseIndex;
 use crate::types::{Entry, Result, ValueRef};
 
 const SSTABLE_WRITE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
-/// Writes a sorted string table (SSTable) and its associated sparse index to disk.
+/// Writes a sorted string table (SSTable), bloom filter, and sparse index to disk.
 ///
 /// # Parameters
 /// - `path`: The file path where the SSTable will be written.
 /// - `index_path`: The file path where the sparse index will be stored.
+/// - `bloom_path`: The file path where the bloom filter will be stored.
 /// - `entries`: A slice of `Entry` objects representing key-value pairs to be written to the SSTable.
 /// - `index_stride`: The interval for including entries in the sparse index. For example, if `index_stride`
 ///   is 4, every fourth entry will be included in the sparse index.
@@ -25,25 +27,30 @@ const SSTABLE_WRITE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 /// - The function streams the key-value pairs from `entries` to the SSTable file specified in `path`.
 /// - As it writes the SSTable, it records sparse index points at intervals defined by `index_stride`. Each
 ///   sparse index point consists of a key and its byte offset in the SSTable file.
-/// - The sparse index is then written to the file specified in `index_path`.
+/// - The bloom filter and sparse index are then written to their companion files.
 ///
 /// # Errors
 /// - Returns an error if there is an issue creating or writing to the SSTable or index files.
 /// - Returns an error if `index_stride` is `0`, leading to invalid behavior.
 ///
 /// # Example
-/// ```
+/// ```ignore
+/// use ForgeEngine::sstable::writer::write_sstable;
+/// use ForgeEngine::sstable::bloom::BloomConfig;
+/// use ForgeEngine::types::{Entry, ValueRef};
 /// use std::path::Path;
 ///
 /// let entries = vec![
-///     Entry { key: "apple".to_string(), value: "fruit".to_string() },
-///     Entry { key: "banana".to_string(), value: "fruit".to_string() },
-///     Entry { key: "carrot".to_string(), value: "vegetable".to_string() },
+///     Entry { key: "apple".to_string(), value: ValueRef::Value(b"fruit".to_vec()), seq: 1 },
+///     Entry { key: "banana".to_string(), value: ValueRef::Value(b"fruit".to_vec()), seq: 2 },
+///     Entry { key: "carrot".to_string(), value: ValueRef::Value(b"vegetable".to_vec()), seq: 3 },
 /// ];
 /// let path = Path::new("sstable.dat");
 /// let index_path = Path::new("sparse_index.dat");
+/// let bloom_path = Path::new("sstable.bf");
+/// let bloom_config = BloomConfig::default();
 ///
-/// write_sstable(&path, &index_path, &entries, 2).expect("Failed to write SSTable");
+/// write_sstable(&path, &index_path, &bloom_path, bloom_config, &entries, 2).expect("Failed to write SSTable");
 /// ```
 ///
 /// # Notes
@@ -58,23 +65,28 @@ const SSTABLE_WRITE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 pub fn write_sstable(
     path: &Path,
     index_path: &Path,
+    bloom_path: &Path,
+    bloom_config: BloomConfig,
     entries: &[Entry],
     index_stride: usize,
 ) -> Result<()> {
     write_sstable_entries(
         path,
         index_path,
+        bloom_path,
+        bloom_config,
         entries.iter(),
         index_stride,
         Some(entries.len()),
     )
 }
 
-/// Writes a sorted string table (SSTable) from an entry iterator and its associated sparse index to disk.
+/// Writes a sorted string table (SSTable) from an entry iterator and its associated bloom filter and sparse index to disk.
 ///
 /// # Parameters
 /// - `path`: The file path where the SSTable will be written.
 /// - `index_path`: The file path where the sparse index will be stored.
+/// - `bloom_path`: The file path where the bloom filter will be stored.
 /// - `entries`: An iterator of `Entry` objects representing sorted key-value pairs to write.
 /// - `index_stride`: The interval for including entries in the sparse index.
 ///
@@ -95,20 +107,23 @@ pub fn write_sstable(
 pub fn write_sstable_iter<I>(
     path: &Path,
     index_path: &Path,
+    bloom_path: &Path,
+    bloom_config: BloomConfig,
     entries: I,
     index_stride: usize,
 ) -> Result<()>
 where
     I: IntoIterator<Item = Entry>,
 {
-    write_sstable_entries(path, index_path, entries, index_stride, None)
+    write_sstable_entries(path, index_path, bloom_path, bloom_config, entries, index_stride, None)
 }
 
-/// Writes a sorted string table (SSTable) from borrowed entry fields and its associated sparse index to disk.
+/// Writes a sorted string table (SSTable) from borrowed entry fields and its associated bloom filter and sparse index to disk.
 ///
 /// # Parameters
 /// - `path`: The file path where the SSTable will be written.
 /// - `index_path`: The file path where the sparse index will be stored.
+/// - `bloom_path`: The file path where the bloom filter will be stored.
 /// - `entries`: An iterator of borrowed entry fields in sorted key order.
 /// - `index_stride`: The interval for including entries in the sparse index.
 ///
@@ -129,6 +144,8 @@ where
 pub fn write_sstable_refs<'a, I>(
     path: &Path,
     index_path: &Path,
+    bloom_path: &Path,
+    bloom_config: BloomConfig,
     entries: I,
     index_stride: usize,
 ) -> Result<()>
@@ -140,8 +157,10 @@ where
 
     let mut offset = 0u64;
     let index_stride = index_stride.max(1);
+    let mut bloom = BloomFilter::builder_with(bloom_config);
     let mut sparse = Vec::new();
     for (i, (key, seq, value)) in entries.into_iter().enumerate() {
+        bloom.insert(key);
         if i % index_stride == 0 {
             sparse.push((key.clone(), offset));
         }
@@ -149,6 +168,7 @@ where
     }
 
     writer.flush()?;
+    bloom.finish().save(bloom_path)?;
     SparseIndex::new(sparse).save(index_path)?;
     Ok(())
 }
@@ -156,6 +176,8 @@ where
 fn write_sstable_entries<I>(
     path: &Path,
     index_path: &Path,
+    bloom_path: &Path,
+    bloom_config: BloomConfig,
     entries: I,
     index_stride: usize,
     size_hint: Option<usize>,
@@ -169,9 +191,11 @@ where
 
     let mut offset = 0u64;
     let index_stride = index_stride.max(1);
+    let mut bloom = BloomFilter::builder_with(bloom_config);
     let mut sparse = Vec::with_capacity(size_hint.map_or(0, |len| len.div_ceil(index_stride)));
     for (i, entry) in entries.into_iter().enumerate() {
         let entry = entry.borrow();
+        bloom.insert(&entry.key);
         if i % index_stride == 0 {
             sparse.push((entry.key.clone(), offset));
         }
@@ -179,6 +203,7 @@ where
     }
 
     writer.flush()?;
+    bloom.finish().save(bloom_path)?;
     SparseIndex::new(sparse).save(index_path)?;
     Ok(())
 }

@@ -75,4 +75,20 @@ mod tests {
 
         let _ = fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn flush_writes_bloom_filter_companion_file() {
+        let dir = temp_dir();
+
+        {
+            let mut db = Db::open(&dir).expect("open");
+            db.put("bloomed", b"value".to_vec()).expect("put");
+            db.sync().expect("sync");
+        }
+
+        let bloom = dir.join("L0_1.bf");
+        assert!(bloom.exists());
+
+        let _ = fs::remove_dir_all(dir);
+    }
 }

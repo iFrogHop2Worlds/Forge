@@ -62,15 +62,13 @@ fn run_repl(initial_db_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
         let cmd = tokens[0].to_ascii_uppercase();
         match cmd.as_str() {
-            "TEST" => {
-                let start = std::time::Instant::now();
+            "TW" => {
                 if tokens.len() < 2 {
                     eprintln!("usage: TEST <number of entries>");
                     continue;
                 }
-
                 let num = tokens[1].parse::<usize>()?;
-
+                let start = std::time::Instant::now();
                 for i in 0..num {
                     let random_number = rand::random::<u32>();
                     let person = {
@@ -84,6 +82,20 @@ fn run_repl(initial_db_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                         person
                     };
                     db.put(i.to_string(), person.into_bytes())?;
+                }
+                let finish = std::time::Instant::now() - start;
+                println!("finished in {}ms", finish.as_millis());
+            }
+            "TG" => {
+                if tokens.len() < 2 {
+                    eprintln!("usage: TEST <number of entries>");
+                    continue;
+                }
+
+                let num = tokens[1].parse::<usize>()?;
+                let start = std::time::Instant::now();
+                for i in 0..num {
+                    db.get(i.to_string().as_str())?;
                 }
                 let finish = std::time::Instant::now() - start;
                 println!("finished in {}ms", finish.as_millis());
