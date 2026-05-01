@@ -94,8 +94,13 @@ fn run_repl(initial_db_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
                 let num = tokens[1].parse::<usize>()?;
                 let start = std::time::Instant::now();
+
+                let mut index_buffer = String::new();
                 for i in 0..num {
-                    db.get(i.to_string().as_str())?;
+                    index_buffer.clear();
+                    use std::fmt::Write;
+                    write!(&mut index_buffer, "{}", i).unwrap();
+                    db.get(&index_buffer)?;
                 }
                 let finish = std::time::Instant::now() - start;
                 println!("finished in {}ms", finish.as_millis());

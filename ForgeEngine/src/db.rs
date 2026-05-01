@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use crate::compaction::{CompactionIterator, DbIterator, MergeIterator, TableIterator};
 use crate::manifest::{Manifest, TableMeta};
 use crate::memtable::MemTable;
-use crate::sstable::{bloom::BloomConfig, reader, writer};
+use crate::sstable::{bloom::BloomConfig, reader, table::TableCache, writer};
 use crate::types::{Entry, Result, ValueRef};
 use crate::wal::Wal;
 
@@ -36,6 +36,7 @@ pub struct Db {
     wal: Wal,
     memtable: MemTable,
     levels: Vec<Vec<TableMeta>>,
+    table_cache: Vec<Vec<TableCache>>,
     next_seq: u64,
     next_table_id: u64,
     memtable_limit_bytes: usize,
@@ -104,6 +105,7 @@ impl Db {
 
         let levels = manifest.levels;
         let next_table_id = manifest.next_table_id;
+        let table_cache = Self::build_table_cache(&levels)?;
 
         let mut memtable = MemTable::new();
         let wal_path = dir.join("current.wal");
@@ -121,6 +123,7 @@ impl Db {
             wal,
             memtable,
             levels,
+            table_cache,
             next_seq,
             next_table_id,
             memtable_limit_bytes: DEFAULT_MEMTABLE_LIMIT_BYTES,
@@ -228,7 +231,7 @@ impl Db {
     /// Retrieves the value associated with the specified `key` from the database.
     ///
     /// This function searches for the key in the in-memory `memtable` first and, if not found,
-    /// proceeds to look through the levels of on-disk tables. Depending on the value associated
+    /// consults the cached on-disk table metadata. Depending on the value associated
     /// with the key, it returns one of the following:
     ///
     /// - `Ok(Some(Vec<u8>))`: The key exists and has an associated value.
@@ -253,9 +256,9 @@ impl Db {
     /// 1. The function first checks the in-memory `memtable` for the key.
     ///    - If found, it distinguishes whether the key has an associated value (`ValueRef::Value`)
     ///      or has been logically deleted (`ValueRef::Tombstone`).
-    /// 2. If the key is not present in the `memtable`, it scans the on-disk levels.
-    ///    - Each level is searched sequentially, and the on-disk tables are accessed using the
-    ///      `reader::get` function.
+    /// 2. If the key is not present in the `memtable`, it scans the cached on-disk levels.
+    ///    - Each level is searched sequentially using the in-memory `TableCache` entries loaded at startup.
+    ///    - Each table cache provides a cached bloom filter, sparse index, and an open SSTable handle clone.
     ///    - If the key is located in these tables, the function behaves similarly to the `memtable`
     ///      lookup, differentiating based on `ValueRef`.
     /// 3. If the key is not found in either the `memtable` or the on-disk tables, the function
@@ -263,8 +266,8 @@ impl Db {
     ///
     /// # Errors
     ///
-    /// This function may return an error if an issue occurs while accessing the on-disk tables,
-    /// such as a file I/O error during the execution of `reader::get`.
+    /// This function may return an error if an issue occurs while accessing the cached on-disk tables,
+    /// such as a file I/O error while cloning a cached SSTable handle or decoding a cached index/filter.
     ///
     /// # Examples
     ///
@@ -283,9 +286,9 @@ impl Db {
             };
         }
 
-        for level in &self.levels {
+        for level in &self.table_cache {
             for t in level {
-                if let Some(entry) = reader::get(&t.data_path, &t.index_path, &t.bloom_path, key)? {
+                if let Some(entry) = reader::get_cached(t, key)? {
                     return match entry.value {
                         ValueRef::Value(v) => Ok(Some(v)),
                         ValueRef::Tombstone => Ok(None),
@@ -298,7 +301,7 @@ impl Db {
     }
 
     /// Flushes the current in-memory memtable to persistent storage by streaming it to a new
-    /// SSTable and updating the associated metadata and indices.
+    /// SSTable and updating the associated metadata and cached table state.
     ///
     /// # Workflow
     /// 1. Checks if the memtable is empty; if so, the function returns `Ok(())` without taking any action.
@@ -306,12 +309,13 @@ impl Db {
     /// 3. Generates a new table ID and creates metadata for the new SSTable.
     /// 4. Streams borrowed entries from the memtable in sorted key order.
     /// 5. Calls the `writer::write_sstable_refs` function to write the borrowed entries to disk,
-    ///    creating both the data file and the index file for the new SSTable.
+    ///    creating the data file, sparse index, and bloom filter for the new SSTable.
     /// 6. Updates the metadata for level 0 of the storage hierarchy to include the newly created SSTable.
-    /// 7. Persists the updated manifest file containing the storage system's structure.
-    /// 8. Clears the in-memory memtable, resetting its state for future use.
-    /// 9. Resets the WAL to prepare for future writes.
-    /// 10. Initiates a background compaction process starting from level 0 if necessary.
+    /// 7. Rebuilds the in-memory table cache so future reads can reuse the new table without reopening files.
+    /// 8. Persists the updated manifest file containing the storage system's structure.
+    /// 9. Clears the in-memory memtable, resetting its state for future use.
+    /// 10. Resets the WAL to prepare for future writes.
+    /// 11. Initiates a background compaction process starting from level 0 if necessary.
     ///
     /// # Returns
     /// * `Result<()>`: Returns `Ok(())` if the flush operation is successful. If any stage fails,
@@ -320,7 +324,7 @@ impl Db {
     /// # Errors
     /// This function can return an `Err` in the following conditions:
     /// * If flushing the WAL fails.
-    /// * If streaming the borrowed memtable entries to the SSTable or index file fails.
+    /// * If streaming the borrowed memtable entries to the SSTable, sparse index, or bloom filter fails.
     /// * If persisting the manifest fails.
     /// * If an issue occurs during memtable clearance or WAL reset.
     ///
@@ -347,6 +351,7 @@ impl Db {
             16,
         )?;
         self.levels[0].insert(0, meta);
+        self.table_cache = Self::build_table_cache(&self.levels)?;
         self.persist_manifest()?;
 
         self.memtable.clear();
@@ -475,6 +480,8 @@ impl Db {
 
         let old_level_tables: Vec<_> = self.levels[level].drain(..).collect();
         let old_next_level_tables: Vec<_> = self.levels[next_level].drain(..).collect();
+        self.table_cache[level].clear();
+        self.table_cache[next_level].clear();
 
         for old in old_level_tables
             .into_iter()
@@ -486,6 +493,7 @@ impl Db {
 
         self.levels[next_level].push(output);
         self.levels[next_level].sort_by(|a, b| b.id.cmp(&a.id));
+        self.table_cache = Self::build_table_cache(&self.levels)?;
         self.persist_manifest()?;
 
         Ok(())
@@ -520,6 +528,22 @@ impl Db {
             levels: self.levels.clone(),
         };
         manifest.save(&self.dir)
+    }
+
+    fn build_table_cache(levels: &[Vec<TableMeta>]) -> Result<Vec<Vec<TableCache>>> {
+        let mut out = Vec::with_capacity(levels.len());
+        for level in levels {
+            let mut cached_level = Vec::with_capacity(level.len());
+            for table in level {
+                cached_level.push(TableCache::load(
+                    &table.data_path,
+                    &table.index_path,
+                    &table.bloom_path,
+                )?);
+            }
+            out.push(cached_level);
+        }
+        Ok(out)
     }
 
     /// Builds a `Manifest` by scanning the contents of a specified directory on disk.

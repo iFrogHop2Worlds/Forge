@@ -6,6 +6,7 @@ use crate::sstable::bloom::BloomFilter;
 use crate::sstable::block::read_entry;
 use crate::sstable::index::SparseIndex;
 use crate::types::{Entry, Result};
+use crate::sstable::table::TableCache;
 
 /// Iterates over entries in an SSTable file.
 ///
@@ -179,6 +180,38 @@ pub fn get(path: &Path, index_path: &Path, bloom_path: &Path, key: &str) -> Resu
     let index = SparseIndex::load(index_path)?;
     let mut reader = BufReader::new(File::open(path)?);
     let start = index.floor_offset_for(key);
+    reader.seek(SeekFrom::Start(start))?;
+
+    loop {
+        match read_entry(&mut reader) {
+            Ok(entry) => {
+                if entry.key == key {
+                    return Ok(Some(entry));
+                }
+                if entry.key.as_str() > key {
+                    return Ok(None);
+                }
+            }
+            Err(crate::types::ForgeError::Io(err)) if err.kind() == ErrorKind::UnexpectedEof => {
+                return Ok(None);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Looks up a key using a cached SSTable table state.
+///
+/// # Behavior
+/// - Uses the cached bloom filter and sparse index already loaded at startup.
+/// - Clones the cached SSTable data handle for the read without reopening the file by path.
+pub fn get_cached(table: &TableCache, key: &str) -> Result<Option<Entry>> {
+    if !table.bloom().might_contain(key) {
+        return Ok(None);
+    }
+
+    let mut reader = BufReader::new(table.try_clone_data_file()?);
+    let start = table.index().floor_offset_for(key);
     reader.seek(SeekFrom::Start(start))?;
 
     loop {
