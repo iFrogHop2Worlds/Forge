@@ -301,6 +301,40 @@ impl Db {
         Ok(None)
     }
 
+    /// Retrieves a value while bypassing the decoded block cache.
+    pub fn get_uncached(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        if let Some((_, v)) = self.memtable.get(key) {
+            return match v {
+                ValueRef::Value(bytes) => Ok(Some(bytes)),
+                ValueRef::Tombstone => Ok(None),
+            };
+        }
+
+        for level in &self.table_cache {
+            for t in level {
+                if let Some(entry) = reader::get_uncached(t, key)? {
+                    return match entry.value {
+                        ValueRef::Value(v) => Ok(Some(v)),
+                        ValueRef::Tombstone => Ok(None),
+                    };
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Returns lookup diagnostics for a key across all cached tables.
+    pub fn debug_lookup(&self, key: &str) -> Vec<(usize, usize, crate::sstable::table::LookupDebug)> {
+        let mut out = Vec::new();
+        for (level_idx, level) in self.table_cache.iter().enumerate() {
+            for (table_idx, table) in level.iter().enumerate() {
+                out.push((level_idx, table_idx, table.lookup_debug(key)));
+            }
+        }
+        out
+    }
+
     /// Flushes the current in-memory memtable to persistent storage by streaming it to a new
     /// SSTable and updating the associated metadata and cached table state.
     ///

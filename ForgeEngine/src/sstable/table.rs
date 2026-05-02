@@ -1,6 +1,10 @@
 use std::fs::File;
+use std::io::BufReader;
 use std::path::Path;
-use std::{collections::{HashMap, VecDeque}, sync::Mutex};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::{Arc, Mutex},
+};
 
 use crate::sstable::block_index::BlockIndex;
 use crate::sstable::bloom::BloomFilter;
@@ -15,7 +19,7 @@ use crate::types::{Entry, Result};
 /// - Caches decoded blocks in a bounded LRU so repeated reads can skip decompression and entry decoding.
 #[derive(Debug)]
 pub struct TableCache {
-    data_file: File,
+    reader: Mutex<BufReader<File>>,
     block_index: Option<BlockIndex>,
     bloom: BloomFilter,
     index: SparseIndex,
@@ -24,7 +28,7 @@ pub struct TableCache {
 
 #[derive(Debug)]
 struct BlockCache {
-    map: HashMap<u64, Vec<Entry>>,
+    map: HashMap<u64, Arc<[Entry]>>,
     order: VecDeque<u64>,
     capacity: usize,
 }
@@ -38,7 +42,7 @@ impl BlockCache {
         }
     }
 
-    fn get(&mut self, offset: u64) -> Option<Vec<Entry>> {
+    fn get(&mut self, offset: u64) -> Option<Arc<[Entry]>> {
         let value = self.map.get(&offset).cloned();
         if value.is_some() {
             self.touch(offset);
@@ -46,7 +50,7 @@ impl BlockCache {
         value
     }
 
-    fn insert(&mut self, offset: u64, block: Vec<Entry>) {
+    fn insert(&mut self, offset: u64, block: Arc<[Entry]>) {
         if self.map.contains_key(&offset) {
             self.map.insert(offset, block);
             self.touch(offset);
@@ -79,7 +83,7 @@ impl TableCache {
     /// - Tables written before the block index existed still load successfully with only the sparse index.
     pub fn load(data_path: &Path, index_path: &Path, bloom_path: &Path) -> Result<Self> {
         Ok(Self {
-            data_file: File::open(data_path)?,
+            reader: Mutex::new(BufReader::new(File::open(data_path)?)),
             block_index: None,
             bloom: BloomFilter::load(bloom_path)?,
             index: SparseIndex::load(index_path)?,
@@ -98,20 +102,12 @@ impl TableCache {
         bloom_path: &Path,
     ) -> Result<Self> {
         Ok(Self {
-            data_file: File::open(data_path)?,
+            reader: Mutex::new(BufReader::new(File::open(data_path)?)),
             block_index: Some(BlockIndex::load(block_index_path)?),
             bloom: BloomFilter::load(bloom_path)?,
             index: SparseIndex::load(index_path)?,
             block_cache: Mutex::new(BlockCache::new(64)),
         })
-    }
-
-    /// Creates a new read handle to the table data file.
-    ///
-    /// # Notes
-    /// - This clones the cached file handle rather than reopening the path.
-    pub fn try_clone_data_file(&self) -> Result<File> {
-        Ok(self.data_file.try_clone()?)
     }
 
     /// Returns the cached bloom filter.
@@ -130,12 +126,12 @@ impl TableCache {
     }
 
     /// Returns a cached decoded block if available.
-    pub fn cached_block(&self, offset: u64) -> Option<Vec<Entry>> {
+    pub fn cached_block(&self, offset: u64) -> Option<Arc<[Entry]>> {
         self.block_cache.lock().ok().and_then(|mut cache| cache.get(offset))
     }
 
     /// Stores a decoded block in the cache.
-    pub fn insert_block_cache(&self, offset: u64, block: Vec<Entry>) {
+    pub fn insert_block_cache(&self, offset: u64, block: Arc<[Entry]>) {
         if let Ok(mut cache) = self.block_cache.lock() {
             cache.insert(offset, block);
         }
@@ -143,12 +139,9 @@ impl TableCache {
 
     /// Reads a block by offset and decodes the contained entries.
     pub fn load_block_entries(&self, offset: u64, byte_len: u32, entry_count: u32) -> Result<Vec<Entry>> {
-        use std::io::{Cursor, Read, Seek, SeekFrom};
+        use std::io::Cursor;
 
-        let mut reader = std::io::BufReader::new(self.try_clone_data_file()?);
-        reader.seek(SeekFrom::Start(offset))?;
-        let mut buf = vec![0u8; byte_len as usize];
-        reader.read_exact(&mut buf)?;
+        let buf = self.read_exact_at(offset, byte_len as usize)?;
 
         let mut cursor = Cursor::new(buf);
         let mut entries = Vec::with_capacity(entry_count as usize);
@@ -166,6 +159,15 @@ impl TableCache {
         &self,
         key: &str,
     ) -> Result<Option<Entry>> {
+        self.get_from_block_index_impl(key, true)
+    }
+
+    /// Searches the block index without interacting with the LRU block cache.
+    pub fn get_from_block_index_uncached(&self, key: &str) -> Result<Option<Entry>> {
+        self.get_from_block_index_impl(key, false)
+    }
+
+    fn get_from_block_index_impl(&self, key: &str, use_cache: bool) -> Result<Option<Entry>> {
         let block_index = match self.block_index() {
             Some(index) => index,
             None => return Ok(None),
@@ -176,24 +178,93 @@ impl TableCache {
             None => return Ok(None),
         };
 
-        if let Some(block) = self.cached_block(block_meta.offset) {
-            return Ok(scan_block(block, key));
+        if use_cache {
+            if let Some(block) = self.cached_block(block_meta.offset) {
+                return Ok(scan_block(&block, key));
+            }
         }
 
-        let entries = self.load_block_entries(block_meta.offset, block_meta.byte_len, block_meta.entry_count)?;
-        self.insert_block_cache(block_meta.offset, entries.clone());
-        Ok(scan_block(entries, key))
+        let entries: Arc<[Entry]> =
+            self.load_block_entries(block_meta.offset, block_meta.byte_len, block_meta.entry_count)?
+                .into();
+        if use_cache {
+            self.insert_block_cache(block_meta.offset, entries.clone());
+        }
+        Ok(scan_block(&entries, key))
+    }
+
+    pub fn scan_from_offset(&self, start: u64, key: &str) -> Result<Option<Entry>> {
+        use std::io::{ErrorKind, Seek, SeekFrom};
+
+        let mut reader = self
+            .reader
+            .lock()
+            .map_err(|_| crate::types::ForgeError::Corruption("table reader poisoned".to_string()))?;
+        reader.seek(SeekFrom::Start(start))?;
+
+        loop {
+            match crate::sstable::block::read_entry(&mut *reader) {
+                Ok(entry) => {
+                    if entry.key == key {
+                        return Ok(Some(entry));
+                    }
+                    if entry.key.as_str() > key {
+                        return Ok(None);
+                    }
+                }
+                Err(crate::types::ForgeError::Io(err)) if err.kind() == ErrorKind::UnexpectedEof => {
+                    return Ok(None);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    fn read_exact_at(&self, offset: u64, byte_len: usize) -> Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let mut reader = self
+            .reader
+            .lock()
+            .map_err(|_| crate::types::ForgeError::Corruption("table reader poisoned".to_string()))?;
+        reader.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0u8; byte_len];
+        reader.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Returns a compact description of how a key would be searched in this table.
+    pub fn lookup_debug(&self, key: &str) -> LookupDebug {
+        let bloom_maybe = self.bloom.might_contain(key);
+        let block = self
+            .block_index()
+            .and_then(|index| index.floor_block_entry_for(key))
+            .map(|entry| (entry.first_key.clone(), entry.offset, entry.entry_count, entry.byte_len));
+        let sparse_offset = self.index.floor_offset_for(key);
+
+        LookupDebug {
+            bloom_maybe,
+            block,
+            sparse_offset,
+        }
     }
 }
 
-fn scan_block(entries: Vec<Entry>, key: &str) -> Option<Entry> {
+fn scan_block(entries: &[Entry], key: &str) -> Option<Entry> {
     for entry in entries {
         if entry.key == key {
-            return Some(entry);
+            return Some(entry.clone());
         }
         if entry.key.as_str() > key {
             return None;
         }
     }
     None
+}
+
+#[derive(Debug, Clone)]
+pub struct LookupDebug {
+    pub bloom_maybe: bool,
+    pub block: Option<(String, u64, u32, u32)>,
+    pub sparse_offset: u64,
 }

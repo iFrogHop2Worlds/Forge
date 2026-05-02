@@ -174,28 +174,32 @@ where
 {
     let file = File::create(path)?;
     let mut writer = BufWriter::with_capacity(SSTABLE_WRITE_BUFFER_BYTES, file);
+    let entries = entries.into_iter();
+    let (_, upper_bound) = entries.size_hint();
+    let expected_keys = upper_bound.unwrap_or_else(|| entries.size_hint().0).max(1);
 
     let mut offset = 0u64;
     let index_stride = index_stride.max(1);
-    let mut bloom = BloomFilter::builder_with(bloom_config);
+    let mut bloom = BloomFilter::builder_with_expected_keys(bloom_config, expected_keys);
     let mut sparse = Vec::new();
     let mut block_index = Vec::new();
     let mut block_keys: Vec<String> = Vec::new();
     let mut block_offset = 0u64;
     let mut block_entry_count = 0u32;
     let mut block_bytes = 0u32;
-    for (i, (key, seq, value)) in entries.into_iter().enumerate() {
+    for (i, (key, seq, value)) in entries.enumerate() {
         bloom.insert(key);
         if block_entry_count == 0 {
             block_offset = offset;
         }
+        let entry_offset = offset;
         let entry_bytes = write_entry_ref(&mut writer, seq, key, value)? as u64;
         offset += entry_bytes;
         block_bytes = block_bytes.saturating_add(entry_bytes as u32);
         block_entry_count += 1;
         block_keys.push(key.clone());
         if i % index_stride == 0 {
-            sparse.push((key.clone(), offset));
+            sparse.push((key.clone(), entry_offset));
         }
 
         if block_bytes as usize >= BLOCK_TARGET_BYTES {
@@ -243,29 +247,35 @@ where
 {
     let file = File::create(path)?;
     let mut writer = BufWriter::with_capacity(SSTABLE_WRITE_BUFFER_BYTES, file);
+    let entries = entries.into_iter();
+    let expected_keys = size_hint
+        .or_else(|| entries.size_hint().1)
+        .unwrap_or_else(|| entries.size_hint().0)
+        .max(1);
 
     let mut offset = 0u64;
     let index_stride = index_stride.max(1);
-    let mut bloom = BloomFilter::builder_with(bloom_config);
+    let mut bloom = BloomFilter::builder_with_expected_keys(bloom_config, expected_keys);
     let mut sparse = Vec::with_capacity(size_hint.map_or(0, |len| len.div_ceil(index_stride)));
     let mut block_index = Vec::new();
     let mut block_keys: Vec<String> = Vec::new();
     let mut block_offset = 0u64;
     let mut block_entry_count = 0u32;
     let mut block_bytes = 0u32;
-    for (i, entry) in entries.into_iter().enumerate() {
+    for (i, entry) in entries.enumerate() {
         let entry = entry.borrow();
         bloom.insert(&entry.key);
         if block_entry_count == 0 {
             block_offset = offset;
         }
+        let entry_offset = offset;
         let entry_bytes = write_entry(&mut writer, entry)? as u64;
         offset += entry_bytes;
         block_bytes = block_bytes.saturating_add(entry_bytes as u32);
         block_entry_count += 1;
         block_keys.push(entry.key.clone());
         if i % index_stride == 0 {
-            sparse.push((entry.key.clone(), offset));
+            sparse.push((entry.key.clone(), entry_offset));
         }
 
         if block_bytes as usize >= BLOCK_TARGET_BYTES {
@@ -295,4 +305,65 @@ where
     bloom.finish().save(bloom_path)?;
     SparseIndex::new(sparse).save(index_path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sstable::index::SparseIndex;
+    use crate::types::ValueRef;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(name: &str) -> PathBuf {
+        let base = std::env::temp_dir();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        base.join(format!("forge_engine_{name}_{ts}"))
+    }
+
+    #[test]
+    fn sparse_index_points_to_entry_start() {
+        let dir = temp_path("sstable_writer");
+        fs::create_dir_all(&dir).expect("dir");
+
+        let data_path = dir.join("table.sst");
+        let index_path = dir.join("table.index");
+        let block_index_path = dir.join("table.block");
+        let bloom_path = dir.join("table.bf");
+
+        let entries = vec![
+            Entry {
+                key: "a".to_string(),
+                value: ValueRef::Value(b"one".to_vec()),
+                seq: 1,
+            },
+            Entry {
+                key: "b".to_string(),
+                value: ValueRef::Value(b"two".to_vec()),
+                seq: 2,
+            },
+        ];
+
+        write_sstable(
+            &data_path,
+            &index_path,
+            &block_index_path,
+            &bloom_path,
+            BloomConfig::default(),
+            &entries,
+            1,
+        )
+        .expect("write");
+
+        let sparse = SparseIndex::load(&index_path).expect("load index");
+        assert_eq!(sparse.entries[0].0, "a");
+        assert_eq!(sparse.entries[0].1, 0);
+        assert!(sparse.entries[1].1 > sparse.entries[0].1);
+
+        let _ = fs::remove_dir_all(dir);
+    }
 }

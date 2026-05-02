@@ -19,6 +19,7 @@ struct Cli {
 enum Command {
     Put { key: String, value: String },
     Get { key: String },
+    DebugGet { key: String },
     Delete { key: String },
     Sync,
 }
@@ -127,6 +128,23 @@ fn run_repl(initial_db_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                     None => println!("(nil)"),
                 }
             }
+            "DEBUGGET" => {
+                if tokens.len() != 2 {
+                    eprintln!("usage: DEBUGGET <key>");
+                    continue;
+                }
+                let key = tokens[1];
+                for (level_idx, table_idx, info) in db.debug_lookup(key) {
+                    println!(
+                        "level={level_idx} table={table_idx} bloom={} sparse_offset={} block={:?}",
+                        info.bloom_maybe, info.sparse_offset, info.block
+                    );
+                }
+                match db.get(key)? {
+                    Some(value) => println!("{}", String::from_utf8_lossy(&value)),
+                    None => println!("(nil)"),
+                }
+            }
             "DEL" | "DELETE" => {
                 if tokens.len() != 2 {
                     eprintln!("usage: DEL <key>");
@@ -210,6 +228,18 @@ fn run_command(db_path: &str, command: Command) -> Result<(), Box<dyn std::error
             Some(value) => println!("{}", String::from_utf8_lossy(&value)),
             None => println!("(nil)"),
         },
+        Command::DebugGet { key } => {
+            for (level_idx, table_idx, info) in db.debug_lookup(&key) {
+                println!(
+                    "level={level_idx} table={table_idx} bloom={} sparse_offset={} block={:?}",
+                    info.bloom_maybe, info.sparse_offset, info.block
+                );
+            }
+            match db.get(&key)? {
+                Some(value) => println!("{}", String::from_utf8_lossy(&value)),
+                None => println!("(nil)"),
+            }
+        }
         Command::Delete { key } => {
             db.delete(key)?;
             println!("ok");

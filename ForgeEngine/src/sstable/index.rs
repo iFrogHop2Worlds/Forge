@@ -128,14 +128,13 @@ impl SparseIndex {
     /// # Notes
     /// - This method assumes the sparse index entries are sorted by key.
     pub fn floor_offset_for(&self, key: &str) -> u64 {
-        let mut best = 0;
-        for (k, offset) in &self.entries {
-            if k.as_str() <= key {
-                best = *offset;
-            } else {
-                break;
-            }
+        match self
+            .entries
+            .binary_search_by(|(k, _)| k.as_str().cmp(key))
+        {
+            Ok(idx) => self.entries[idx].1,
+            Err(0) => 0,
+            Err(idx) => self.entries[idx - 1].1,
         }
-        best
     }
 }

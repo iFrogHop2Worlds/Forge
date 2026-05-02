@@ -57,7 +57,6 @@ pub struct BloomBuilder {
     bit_count: usize,
     hash_count: u32,
     entry_count: usize,
-    bits_per_key: usize,
 }
 
 impl BloomFilter {
@@ -69,6 +68,11 @@ impl BloomFilter {
     /// Creates a streaming bloom builder with custom parameters.
     pub fn builder_with(config: BloomConfig) -> BloomBuilder {
         BloomBuilder::new(config)
+    }
+
+    /// Creates a bloom builder sized for an expected number of keys.
+    pub fn builder_with_expected_keys(config: BloomConfig, expected_keys: usize) -> BloomBuilder {
+        BloomBuilder::with_expected_keys(config, expected_keys)
     }
 
     /// Builds a bloom filter from the provided keys.
@@ -145,19 +149,22 @@ impl BloomFilter {
 
 impl BloomBuilder {
     fn new(config: BloomConfig) -> Self {
+        Self::with_expected_keys(config, 1)
+    }
+
+    fn with_expected_keys(config: BloomConfig, expected_keys: usize) -> Self {
+        let bit_count = (expected_keys.max(1) * config.bits_per_key.max(1)).max(8);
         Self {
-            bits: vec![0u8; 1],
-            bit_count: 8,
+            bits: vec![0u8; bit_count.div_ceil(8)],
+            bit_count,
             hash_count: config.hash_count.max(1),
             entry_count: 0,
-            bits_per_key: config.bits_per_key.max(1),
         }
     }
 
     /// Inserts one key into the builder.
     pub fn insert(&mut self, key: &str) {
         self.entry_count += 1;
-        self.grow_if_needed();
         let (h1, h2) = hash_pair(key);
         for i in 0..self.hash_count {
             let idx = index_for_hashes(self.bit_count, h1, h2, i);
@@ -174,21 +181,31 @@ impl BloomBuilder {
             entry_count: self.entry_count,
         }
     }
-
-    fn grow_if_needed(&mut self) {
-        let target_bits = (self.entry_count.max(1) * self.bits_per_key).max(8);
-        if target_bits <= self.bit_count {
-            return;
-        }
-
-        self.bit_count = target_bits;
-        self.bits.resize(self.bit_count.div_ceil(8), 0);
-    }
-
     fn set_bit(&mut self, idx: usize) {
         let byte = idx / 8;
         let bit = idx % 8;
         self.bits[byte] |= 1 << bit;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builder_with_expected_keys_preserves_existing_membership() {
+        let mut builder = BloomBuilder::with_expected_keys(BloomConfig {
+            bits_per_key: 8,
+            hash_count: 6,
+        }, 10_001);
+
+        builder.insert("4");
+        for i in 0..10_000 {
+            builder.insert(&i.to_string());
+        }
+
+        let filter = builder.finish();
+        assert!(filter.might_contain("4"));
     }
 }
 

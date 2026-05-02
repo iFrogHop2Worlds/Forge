@@ -68,27 +68,18 @@ impl BlockIndex {
 
     /// Returns the block offset that should be searched for a key.
     pub fn floor_block_offset_for(&self, key: &str) -> Option<u64> {
-        let mut best = None;
-        for e in &self.entries {
-            if e.first_key.as_str() <= key {
-                best = Some(e.offset);
-            } else {
-                break;
-            }
-        }
-        best
+        self.floor_block_entry_for(key).map(|entry| entry.offset)
     }
 
     /// Returns the block entry that should be searched for a key.
     pub fn floor_block_entry_for(&self, key: &str) -> Option<&BlockIndexEntry> {
-        let mut best = None;
-        for e in &self.entries {
-            if e.first_key.as_str() <= key {
-                best = Some(e);
-            } else {
-                break;
-            }
+        match self
+            .entries
+            .binary_search_by(|entry| entry.first_key.as_str().cmp(key))
+        {
+            Ok(idx) => self.entries.get(idx),
+            Err(0) => None,
+            Err(idx) => self.entries.get(idx - 1),
         }
-        best
     }
 }

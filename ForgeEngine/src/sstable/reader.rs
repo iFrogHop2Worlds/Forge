@@ -214,24 +214,20 @@ pub fn get_cached(table: &TableCache, key: &str) -> Result<Option<Entry>> {
         return Ok(Some(entry));
     }
 
-    let mut reader = BufReader::new(table.try_clone_data_file()?);
     let start = table.index().floor_offset_for(key);
-    reader.seek(SeekFrom::Start(start))?;
+    table.scan_from_offset(start, key)
+}
 
-    loop {
-        match read_entry(&mut reader) {
-            Ok(entry) => {
-                if entry.key == key {
-                    return Ok(Some(entry));
-                }
-                if entry.key.as_str() > key {
-                    return Ok(None);
-                }
-            }
-            Err(crate::types::ForgeError::Io(err)) if err.kind() == ErrorKind::UnexpectedEof => {
-                return Ok(None);
-            }
-            Err(err) => return Err(err),
-        }
+/// Looks up a key using cached SSTable metadata but bypasses the decoded block LRU.
+pub fn get_uncached(table: &TableCache, key: &str) -> Result<Option<Entry>> {
+    if !table.bloom().might_contain(key) {
+        return Ok(None);
     }
+
+    if let Some(entry) = table.get_from_block_index_uncached(key)? {
+        return Ok(Some(entry));
+    }
+
+    let start = table.index().floor_offset_for(key);
+    table.scan_from_offset(start, key)
 }
