@@ -1,5 +1,6 @@
-use std::collections::BTreeMap;
-use std::collections::btree_map::Entry;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::types::ValueRef;
 
@@ -20,10 +21,31 @@ use crate::types::ValueRef;
 ///   byte count.
 /// - Tombstones are retained in memory as delete markers until the memtable is
 ///   flushed.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MemTable {
-    map: BTreeMap<String, (u64, ValueRef)>,
+    map: HashMap<String, (u64, ValueRef), BuildHasherDefault<FnvHasher>>,
     approx_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct FnvHasher(u64);
+
+impl Hasher for FnvHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+
+        let mut hash = if self.0 == 0 { FNV_OFFSET_BASIS } else { self.0 };
+        for &byte in bytes {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        self.0 = hash;
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
 }
 
 impl MemTable {
@@ -34,9 +56,18 @@ impl MemTable {
     ///   of zero.
     ///
     /// # Behavior
-    /// - Uses the default `BTreeMap` ordering for key storage.
+    /// - Uses a hash map for lower write-path overhead.
     pub fn new() -> Self {
-        Self::default()
+        Self::with_capacity(1 << 20)
+    }
+
+    /// Creates an empty memtable with space reserved for roughly the expected
+    /// number of keys.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            map: HashMap::with_capacity_and_hasher(capacity, BuildHasherDefault::default()),
+            approx_bytes: 0,
+        }
     }
 
     /// Inserts or replaces a key in the memtable.
@@ -57,17 +88,17 @@ impl MemTable {
     pub fn insert(&mut self, seq: u64, key: String, value: ValueRef) {
         let new_size = key.len()
             + match &value {
-                ValueRef::Value(v) => v.len(),
-                ValueRef::Tombstone => 0,
-            };
+            ValueRef::Value(v) => v.len(),
+            ValueRef::Tombstone => 0,
+        };
 
         match self.map.entry(key) {
             Entry::Occupied(mut occupied) => {
                 let old_size = occupied.key().len()
                     + match &occupied.get().1 {
-                        ValueRef::Value(v) => v.len(),
-                        ValueRef::Tombstone => 0,
-                    };
+                    ValueRef::Value(v) => v.len(),
+                    ValueRef::Tombstone => 0,
+                };
                 self.approx_bytes = self.approx_bytes.saturating_sub(old_size);
                 occupied.insert((seq, value));
             }
@@ -110,7 +141,7 @@ impl MemTable {
     /// - Clears the underlying key-value map.
     /// - Resets the approximate byte count to zero.
     pub fn clear(&mut self) {
-        self.map.clear();
+        self.map = HashMap::with_capacity_and_hasher(self.map.capacity(), BuildHasherDefault::default());
         self.approx_bytes = 0;
     }
 
@@ -134,7 +165,7 @@ impl MemTable {
     ///   keys, sequence numbers, and value states in ascending key order.
     ///
     /// # Behavior
-    /// - Uses the natural ordering of the underlying `BTreeMap`.
+    /// - Sorts the hash table contents on demand.
     /// - Clones keys and value states so the iterator output can be used where
     ///   owned entries are required.
     ///
@@ -142,9 +173,13 @@ impl MemTable {
     /// - Flush paths that can write borrowed entries should prefer `iter_sorted_ref`
     ///   to avoid cloning keys and values.
     pub fn iter_sorted(&self) -> impl Iterator<Item = (String, u64, ValueRef)> + '_ {
-        self.map
+        let mut entries: Vec<_> = self
+            .map
             .iter()
             .map(|(k, (seq, value))| (k.clone(), *seq, value.clone()))
+            .collect();
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        entries.into_iter()
     }
 
     /// Iterates over borrowed memtable entries in sorted key order.
@@ -155,13 +190,18 @@ impl MemTable {
     ///   key order.
     ///
     /// # Behavior
-    /// - Uses the natural ordering of the underlying `BTreeMap`.
+    /// - Sorts the hash table contents on demand.
     /// - Avoids cloning keys and values while the memtable is being flushed.
     ///
     /// # Notes
     /// - This iterator is intended for streaming encoders that do not need owned
     ///   `Entry` values.
-    pub fn iter_sorted_ref(&self) -> impl Iterator<Item = (&String, u64, &ValueRef)> + '_ {
-        self.map.iter().map(|(k, (seq, value))| (k, *seq, value))
+    pub fn sorted_kv_ref(&self) -> Vec<(&String, &(u64, ValueRef))> {
+        let mut entries: Vec<_> = self
+            .map
+            .iter()
+            .collect();
+        entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        entries
     }
 }

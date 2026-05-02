@@ -6,6 +6,7 @@ use std::path::Path;
 use crate::sstable::bloom::{BloomConfig, BloomFilter};
 use crate::sstable::block_index::{BlockIndex, BlockIndexEntry};
 use crate::sstable::block::{write_entry, write_entry_ref};
+use crate::sstable::fence::KeyRangeFence;
 use crate::sstable::index::SparseIndex;
 use crate::types::{Entry, Result, ValueRef};
 
@@ -72,6 +73,7 @@ pub fn write_sstable(
     index_path: &Path,
     block_index_path: &Path,
     bloom_path: &Path,
+    fence_path: &Path,
     bloom_config: BloomConfig,
     entries: &[Entry],
     index_stride: usize,
@@ -81,6 +83,7 @@ pub fn write_sstable(
         index_path,
         block_index_path,
         bloom_path,
+        fence_path,
         bloom_config,
         entries.iter(),
         index_stride,
@@ -117,6 +120,7 @@ pub fn write_sstable_iter<I>(
     index_path: &Path,
     block_index_path: &Path,
     bloom_path: &Path,
+    fence_path: &Path,
     bloom_config: BloomConfig,
     entries: I,
     index_stride: usize,
@@ -129,6 +133,7 @@ where
         index_path,
         block_index_path,
         bloom_path,
+        fence_path,
         bloom_config,
         entries,
         index_stride,
@@ -165,12 +170,13 @@ pub fn write_sstable_refs<'a, I>(
     index_path: &Path,
     block_index_path: &Path,
     bloom_path: &Path,
+    fence_path: &Path,
     bloom_config: BloomConfig,
     entries: I,
     index_stride: usize,
 ) -> Result<()>
 where
-    I: IntoIterator<Item = (&'a String, u64, &'a ValueRef)>,
+    I: IntoIterator<Item = (&'a String, &'a (u64, ValueRef))>,
 {
     let file = File::create(path)?;
     let mut writer = BufWriter::with_capacity(SSTABLE_WRITE_BUFFER_BYTES, file);
@@ -181,35 +187,40 @@ where
     let mut offset = 0u64;
     let index_stride = index_stride.max(1);
     let mut bloom = BloomFilter::builder_with_expected_keys(bloom_config, expected_keys);
-    let mut sparse = Vec::new();
-    let mut block_index = Vec::new();
-    let mut block_keys: Vec<String> = Vec::new();
+    let mut sparse = Vec::with_capacity(expected_keys.div_ceil(index_stride));
+    let mut block_index = Vec::with_capacity((expected_keys * 32).div_ceil(BLOCK_TARGET_BYTES));
     let mut block_offset = 0u64;
     let mut block_entry_count = 0u32;
     let mut block_bytes = 0u32;
-    for (i, (key, seq, value)) in entries.enumerate() {
+    let mut block_first_key: Option<String> = None;
+    let mut min_key: Option<String> = None;
+    let mut max_key: Option<String> = None;
+    for (i, (key, (seq, value))) in entries.enumerate() {
         bloom.insert(key);
+        if min_key.is_none() {
+            min_key = Some(key.clone());
+        }
+        max_key = Some(key.clone());
         if block_entry_count == 0 {
             block_offset = offset;
+            block_first_key = Some(key.clone());
         }
         let entry_offset = offset;
-        let entry_bytes = write_entry_ref(&mut writer, seq, key, value)? as u64;
+        let entry_bytes = write_entry_ref(&mut writer, *seq, key, value)? as u64;
         offset += entry_bytes;
         block_bytes = block_bytes.saturating_add(entry_bytes as u32);
         block_entry_count += 1;
-        block_keys.push(key.clone());
         if i % index_stride == 0 {
             sparse.push((key.clone(), entry_offset));
         }
 
         if block_bytes as usize >= BLOCK_TARGET_BYTES {
             block_index.push(BlockIndexEntry {
-                first_key: block_keys.first().cloned().unwrap_or_default(),
+                first_key: block_first_key.take().unwrap_or_default(),
                 offset: block_offset,
                 entry_count: block_entry_count,
                 byte_len: block_bytes,
             });
-            block_keys.clear();
             block_entry_count = 0;
             block_bytes = 0;
         }
@@ -217,7 +228,7 @@ where
 
     if block_entry_count > 0 {
         block_index.push(BlockIndexEntry {
-            first_key: block_keys.first().cloned().unwrap_or_default(),
+            first_key: block_first_key.unwrap_or_default(),
             offset: block_offset,
             entry_count: block_entry_count,
             byte_len: block_bytes,
@@ -228,6 +239,9 @@ where
     BlockIndex::new(BLOCK_TARGET_BYTES as u32, block_index).save(block_index_path)?;
     bloom.finish().save(bloom_path)?;
     SparseIndex::new(sparse).save(index_path)?;
+    if let (Some(min_key), Some(max_key)) = (min_key, max_key) {
+        KeyRangeFence::new(min_key, max_key).save(fence_path)?;
+    }
     Ok(())
 }
 
@@ -236,6 +250,7 @@ fn write_sstable_entries<I>(
     index_path: &Path,
     block_index_path: &Path,
     bloom_path: &Path,
+    fence_path: &Path,
     bloom_config: BloomConfig,
     entries: I,
     index_stride: usize,
@@ -257,35 +272,40 @@ where
     let index_stride = index_stride.max(1);
     let mut bloom = BloomFilter::builder_with_expected_keys(bloom_config, expected_keys);
     let mut sparse = Vec::with_capacity(size_hint.map_or(0, |len| len.div_ceil(index_stride)));
-    let mut block_index = Vec::new();
-    let mut block_keys: Vec<String> = Vec::new();
+    let mut block_index = Vec::with_capacity((expected_keys * 32).div_ceil(BLOCK_TARGET_BYTES));
     let mut block_offset = 0u64;
     let mut block_entry_count = 0u32;
     let mut block_bytes = 0u32;
+    let mut block_first_key: Option<String> = None;
+    let mut min_key: Option<String> = None;
+    let mut max_key: Option<String> = None;
     for (i, entry) in entries.enumerate() {
         let entry = entry.borrow();
         bloom.insert(&entry.key);
+        if min_key.is_none() {
+            min_key = Some(entry.key.clone());
+        }
+        max_key = Some(entry.key.clone());
         if block_entry_count == 0 {
             block_offset = offset;
+            block_first_key = Some(entry.key.clone());
         }
         let entry_offset = offset;
         let entry_bytes = write_entry(&mut writer, entry)? as u64;
         offset += entry_bytes;
         block_bytes = block_bytes.saturating_add(entry_bytes as u32);
         block_entry_count += 1;
-        block_keys.push(entry.key.clone());
         if i % index_stride == 0 {
             sparse.push((entry.key.clone(), entry_offset));
         }
 
         if block_bytes as usize >= BLOCK_TARGET_BYTES {
             block_index.push(BlockIndexEntry {
-                first_key: block_keys.first().cloned().unwrap_or_default(),
+                first_key: block_first_key.take().unwrap_or_default(),
                 offset: block_offset,
                 entry_count: block_entry_count,
                 byte_len: block_bytes,
             });
-            block_keys.clear();
             block_entry_count = 0;
             block_bytes = 0;
         }
@@ -293,7 +313,7 @@ where
 
     if block_entry_count > 0 {
         block_index.push(BlockIndexEntry {
-            first_key: block_keys.first().cloned().unwrap_or_default(),
+            first_key: block_first_key.unwrap_or_default(),
             offset: block_offset,
             entry_count: block_entry_count,
             byte_len: block_bytes,
@@ -304,6 +324,9 @@ where
     BlockIndex::new(BLOCK_TARGET_BYTES as u32, block_index).save(block_index_path)?;
     bloom.finish().save(bloom_path)?;
     SparseIndex::new(sparse).save(index_path)?;
+    if let (Some(min_key), Some(max_key)) = (min_key, max_key) {
+        KeyRangeFence::new(min_key, max_key).save(fence_path)?;
+    }
     Ok(())
 }
 
@@ -334,6 +357,7 @@ mod tests {
         let index_path = dir.join("table.index");
         let block_index_path = dir.join("table.block");
         let bloom_path = dir.join("table.bf");
+        let fence_path = dir.join("table.fence");
 
         let entries = vec![
             Entry {
@@ -353,6 +377,7 @@ mod tests {
             &index_path,
             &block_index_path,
             &bloom_path,
+            &fence_path,
             BloomConfig::default(),
             &entries,
             1,

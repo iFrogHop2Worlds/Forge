@@ -28,6 +28,7 @@ pub struct TableMeta {
     pub index_path: PathBuf,
     pub block_index_path: PathBuf,
     pub bloom_path: PathBuf,
+    pub fence_path: PathBuf,
 }
 
 impl TableMeta {
@@ -55,6 +56,7 @@ impl TableMeta {
             index_path: base_dir.join(format!("L{level}_{id}.idx")),
             block_index_path: base_dir.join(format!("L{level}_{id}.blkidx")),
             bloom_path: base_dir.join(format!("L{level}_{id}.bf")),
+            fence_path: base_dir.join(format!("L{level}_{id}.fence")),
         }
     }
 }

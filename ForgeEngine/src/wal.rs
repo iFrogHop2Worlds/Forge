@@ -3,7 +3,7 @@ use std::io::{BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::types::{Entry, Result, ValueRef};
-use crate::util::{decode_value, read_i32, read_u32, read_u64, write_i32, write_u32, write_u64};
+use crate::util::{decode_value, read_i32, read_u32, read_u64};
 
 /// Represents the write-ahead log used to persist recent database mutations.
 ///
@@ -81,19 +81,22 @@ impl Wal {
     /// # Errors
     /// - Returns an error if any WAL field or byte payload cannot be written.
     pub fn append(&mut self, entry: &Entry) -> Result<()> {
-        write_u64(&mut self.writer, entry.seq)?;
-        write_u32(&mut self.writer, entry.key.len() as u32)?;
         let value_len = match &entry.value {
             ValueRef::Value(v) => v.len() as i32,
             ValueRef::Tombstone => -1,
         };
-        write_i32(&mut self.writer, value_len)?;
+
+        let mut header = [0u8; 16];
+        header[..8].copy_from_slice(&entry.seq.to_le_bytes());
+        header[8..12].copy_from_slice(&(entry.key.len() as u32).to_le_bytes());
+        header[12..16].copy_from_slice(&value_len.to_le_bytes());
+        self.writer.write_all(&header)?;
         self.writer.write_all(entry.key.as_bytes())?;
         if let ValueRef::Value(v) = &entry.value {
             self.writer.write_all(v)?;
         }
 
-        self.buffered_bytes += 8 + 4 + 4 + entry.key.len() + value_len.max(0) as usize;
+        self.buffered_bytes += header.len() + entry.key.len() + value_len.max(0) as usize;
         if self.buffered_bytes >= Self::FLUSH_BYTES {
             self.writer.flush()?;
             self.buffered_bytes = 0;

@@ -206,6 +206,10 @@ pub fn get(path: &Path, index_path: &Path, bloom_path: &Path, key: &str) -> Resu
 /// - Uses the cached bloom filter and sparse index already loaded at startup.
 /// - Clones the cached SSTable data handle for the read without reopening the file by path.
 pub fn get_cached(table: &TableCache, key: &str) -> Result<Option<Entry>> {
+    if !table.contains_key_range(key) {
+        return Ok(None);
+    }
+
     if !table.bloom().might_contain(key) {
         return Ok(None);
     }
@@ -220,6 +224,10 @@ pub fn get_cached(table: &TableCache, key: &str) -> Result<Option<Entry>> {
 
 /// Looks up a key using cached SSTable metadata but bypasses the decoded block LRU.
 pub fn get_uncached(table: &TableCache, key: &str) -> Result<Option<Entry>> {
+    if !table.contains_key_range(key) {
+        return Ok(None);
+    }
+
     if !table.bloom().might_contain(key) {
         return Ok(None);
     }

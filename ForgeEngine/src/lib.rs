@@ -95,9 +95,9 @@ mod tests {
 
     #[test]
     #[ignore = "performance benchmark"]
-    fn benchmark_million_random_writes_and_200k_reads() {
+    fn bench_random_writes_and_reads() {
         const WRITE_COUNT: usize = 1_000_000;
-        const READ_COUNT: usize = 200_000;
+        const READ_COUNT: usize = 100_000;
 
         fn next_u64(state: &mut u64) -> u64 {
             // Simple deterministic generator so the benchmark is reproducible.

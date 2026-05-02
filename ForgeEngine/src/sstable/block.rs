@@ -2,7 +2,7 @@ use crate::types::{Entry, Result, ValueRef};
 use crate::util::{
     decode_value, encode_value_len, read_i32, read_u32, read_u64, write_i32, write_u32, write_u64,
 };
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
 /// Writes a single SSTable entry to the provided output stream.
 ///
@@ -106,4 +106,112 @@ pub fn read_entry(mut r: impl Read) -> Result<Entry> {
         value: decode_value(val_len, value_bytes)?,
         seq,
     })
+}
+
+/// Searches a raw encoded SSTable block and returns the matched entry value.
+pub fn find_entry_in_block(block: &[u8], key: &str) -> Result<Option<Entry>> {
+    let mut cursor = Cursor::new(block);
+
+    while (cursor.position() as usize) < block.len() {
+        let seq = read_u64(&mut cursor)?;
+        let key_len = read_u32(&mut cursor)? as usize;
+        let val_len = read_i32(&mut cursor)?;
+
+        let mut key_bytes = vec![0u8; key_len];
+        cursor.read_exact(&mut key_bytes)?;
+        let entry_key = std::str::from_utf8(&key_bytes).map_err(|_| {
+            crate::types::ForgeError::Corruption("non-utf8 key in sstable".to_string())
+        })?;
+
+        let value_len = val_len.max(0) as usize;
+        if entry_key == key {
+            let mut value_bytes = vec![0u8; value_len];
+            if value_len > 0 {
+                cursor.read_exact(&mut value_bytes)?;
+            }
+            return Ok(Some(Entry {
+                key: entry_key.to_string(),
+                value: decode_value(val_len, value_bytes)?,
+                seq,
+            }));
+        }
+
+        if entry_key > key {
+            return Ok(None);
+        }
+
+        if value_len > 0 {
+            let next_pos = cursor.position() + value_len as u64;
+            cursor.set_position(next_pos);
+        }
+    }
+
+    Ok(None)
+}
+
+/// Searches an encoded SSTable stream from its current position without decoding
+/// every full entry value.
+pub fn find_entry_in_stream(mut r: impl Read + Seek, key: &str) -> Result<Option<Entry>> {
+    loop {
+        let seq = match read_u64(&mut r) {
+            Ok(v) => v,
+            Err(crate::types::ForgeError::Io(err))
+                if err.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                return Ok(None);
+            }
+            Err(err) => return Err(err),
+        };
+
+        let key_len = match read_u32(&mut r) {
+            Ok(v) => v as usize,
+            Err(crate::types::ForgeError::Io(err))
+                if err.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                return Ok(None);
+            }
+            Err(err) => return Err(err),
+        };
+        let val_len = match read_i32(&mut r) {
+            Ok(v) => v,
+            Err(crate::types::ForgeError::Io(err))
+                if err.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                return Ok(None);
+            }
+            Err(err) => return Err(err),
+        };
+
+        let mut key_bytes = vec![0u8; key_len];
+        match r.read_exact(&mut key_bytes) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(err) => return Err(err.into()),
+        }
+
+        let entry_key = std::str::from_utf8(&key_bytes).map_err(|_| {
+            crate::types::ForgeError::Corruption("non-utf8 key in sstable".to_string())
+        })?;
+        let value_len = val_len.max(0) as usize;
+
+        if entry_key == key {
+            let mut value_bytes = vec![0u8; value_len];
+            if value_len > 0 {
+                r.read_exact(&mut value_bytes)?;
+            }
+            return Ok(Some(Entry {
+                key: entry_key.to_string(),
+                value: decode_value(val_len, value_bytes)?,
+                seq,
+            }));
+        }
+
+        if entry_key > key {
+            return Ok(None);
+        }
+
+        if value_len > 0 {
+            r.seek(SeekFrom::Current(value_len as i64))?;
+        }
+    }
 }

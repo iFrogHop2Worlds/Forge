@@ -83,9 +83,11 @@ fn run_repl(initial_db_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                         person
                     };
                     db.put(i.to_string(), person.into_bytes())?;
+                  
                 }
                 let finish = std::time::Instant::now() - start;
                 println!("finished in {}ms", finish.as_millis());
+                db.sync()?
             }
             "TG" => {
                 if tokens.len() < 2 {

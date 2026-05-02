@@ -8,6 +8,7 @@ use std::{
 
 use crate::sstable::block_index::BlockIndex;
 use crate::sstable::bloom::BloomFilter;
+use crate::sstable::fence::KeyRangeFence;
 use crate::sstable::index::SparseIndex;
 use crate::types::{Entry, Result};
 
@@ -22,6 +23,7 @@ pub struct TableCache {
     reader: Mutex<BufReader<File>>,
     block_index: Option<BlockIndex>,
     bloom: BloomFilter,
+    fence: Option<KeyRangeFence>,
     index: SparseIndex,
     block_cache: Mutex<BlockCache>,
 }
@@ -29,6 +31,7 @@ pub struct TableCache {
 #[derive(Debug)]
 struct BlockCache {
     map: HashMap<u64, Arc<[Entry]>>,
+    probation: HashMap<u64, u8>,
     order: VecDeque<u64>,
     capacity: usize,
 }
@@ -37,6 +40,7 @@ impl BlockCache {
     fn new(capacity: usize) -> Self {
         Self {
             map: HashMap::new(),
+            probation: HashMap::new(),
             order: VecDeque::new(),
             capacity: capacity.max(1),
         }
@@ -63,8 +67,20 @@ impl BlockCache {
             }
         }
 
+        self.probation.remove(&offset);
         self.order.push_back(offset);
         self.map.insert(offset, block);
+    }
+
+    fn should_promote_after_miss(&mut self, offset: u64) -> bool {
+        if self.probation.len() >= self.capacity.saturating_mul(4) {
+            if let Some(oldest) = self.probation.keys().next().copied() {
+                self.probation.remove(&oldest);
+            }
+        }
+        let count = self.probation.entry(offset).or_insert(0);
+        *count = count.saturating_add(1);
+        *count >= 2
     }
 
     fn touch(&mut self, offset: u64) {
@@ -81,13 +97,18 @@ impl TableCache {
     /// # Notes
     /// - The bloom filter and sparse index are read into memory at startup or after a table rewrite.
     /// - Tables written before the block index existed still load successfully with only the sparse index.
-    pub fn load(data_path: &Path, index_path: &Path, bloom_path: &Path) -> Result<Self> {
+    pub fn load(data_path: &Path, index_path: &Path, bloom_path: &Path, fence_path: &Path) -> Result<Self> {
         Ok(Self {
             reader: Mutex::new(BufReader::new(File::open(data_path)?)),
             block_index: None,
             bloom: BloomFilter::load(bloom_path)?,
+            fence: if fence_path.exists() {
+                Some(KeyRangeFence::load(fence_path)?)
+            } else {
+                None
+            },
             index: SparseIndex::load(index_path)?,
-            block_cache: Mutex::new(BlockCache::new(64)),
+            block_cache: Mutex::new(BlockCache::new(256)),
         })
     }
 
@@ -100,19 +121,33 @@ impl TableCache {
         block_index_path: &Path,
         index_path: &Path,
         bloom_path: &Path,
+        fence_path: &Path,
     ) -> Result<Self> {
         Ok(Self {
             reader: Mutex::new(BufReader::new(File::open(data_path)?)),
             block_index: Some(BlockIndex::load(block_index_path)?),
             bloom: BloomFilter::load(bloom_path)?,
+            fence: if fence_path.exists() {
+                Some(KeyRangeFence::load(fence_path)?)
+            } else {
+                None
+            },
             index: SparseIndex::load(index_path)?,
-            block_cache: Mutex::new(BlockCache::new(64)),
+            block_cache: Mutex::new(BlockCache::new(256)),
         })
     }
 
     /// Returns the cached bloom filter.
     pub fn bloom(&self) -> &BloomFilter {
         &self.bloom
+    }
+
+    pub fn fence(&self) -> Option<&KeyRangeFence> {
+        self.fence.as_ref()
+    }
+
+    pub fn contains_key_range(&self, key: &str) -> bool {
+        self.fence().is_none_or(|fence| fence.contains(key))
     }
 
     /// Returns the cached sparse index.
@@ -184,40 +219,37 @@ impl TableCache {
             }
         }
 
-        let entries: Arc<[Entry]> =
-            self.load_block_entries(block_meta.offset, block_meta.byte_len, block_meta.entry_count)?
-                .into();
-        if use_cache {
-            self.insert_block_cache(block_meta.offset, entries.clone());
+        let raw_block = self.read_exact_at(block_meta.offset, block_meta.byte_len as usize)?;
+        let entry = crate::sstable::block::find_entry_in_block(&raw_block, key)?;
+
+        let should_promote = use_cache
+            && self
+                .block_cache
+                .lock()
+                .map(|mut cache| cache.should_promote_after_miss(block_meta.offset))
+                .unwrap_or(false);
+        if should_promote {
+            use std::io::Cursor;
+
+            let mut cursor = Cursor::new(&raw_block);
+            let mut entries = Vec::with_capacity(block_meta.entry_count as usize);
+            for _ in 0..block_meta.entry_count {
+                entries.push(crate::sstable::block::read_entry(&mut cursor)?);
+            }
+            self.insert_block_cache(block_meta.offset, Arc::<[Entry]>::from(entries));
         }
-        Ok(scan_block(&entries, key))
+        Ok(entry)
     }
 
     pub fn scan_from_offset(&self, start: u64, key: &str) -> Result<Option<Entry>> {
-        use std::io::{ErrorKind, Seek, SeekFrom};
+        use std::io::{Seek, SeekFrom};
 
         let mut reader = self
             .reader
             .lock()
             .map_err(|_| crate::types::ForgeError::Corruption("table reader poisoned".to_string()))?;
         reader.seek(SeekFrom::Start(start))?;
-
-        loop {
-            match crate::sstable::block::read_entry(&mut *reader) {
-                Ok(entry) => {
-                    if entry.key == key {
-                        return Ok(Some(entry));
-                    }
-                    if entry.key.as_str() > key {
-                        return Ok(None);
-                    }
-                }
-                Err(crate::types::ForgeError::Io(err)) if err.kind() == ErrorKind::UnexpectedEof => {
-                    return Ok(None);
-                }
-                Err(err) => return Err(err),
-            }
-        }
+        crate::sstable::block::find_entry_in_stream(&mut *reader, key)
     }
 
     fn read_exact_at(&self, offset: u64, byte_len: usize) -> Result<Vec<u8>> {

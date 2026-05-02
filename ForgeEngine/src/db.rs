@@ -11,7 +11,7 @@ use crate::wal::Wal;
 const DEFAULT_MEMTABLE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_LEVEL: usize = 9;
 const LEVEL_COMPACTION_THRESHOLD: [usize; MAX_LEVEL + 1] =
-    [16, 10, 10, 10, 10, 10, 10, 10, 10, usize::MAX];
+    [32, 16, 16, 16, 16, 16, 16, 16, 16, usize::MAX];
 
 /// The core structure of the Forge data engine
 /// This struct is the backbone of a log structured merge tree (LSM-tree) based engine,
@@ -382,8 +382,9 @@ impl Db {
             &meta.index_path,
             &meta.block_index_path,
             &meta.bloom_path,
+            &meta.fence_path,
             self.bloom_config,
-            self.memtable.iter_sorted_ref(),
+            self.memtable.sorted_kv_ref(),
             16,
         )?;
         self.levels[0].insert(0, meta);
@@ -510,6 +511,7 @@ impl Db {
             &output.index_path,
             &output.block_index_path,
             &output.bloom_path,
+            &output.fence_path,
             self.bloom_config,
             &compacted,
             32,
@@ -528,6 +530,7 @@ impl Db {
             let _ = fs::remove_file(old.index_path);
             let _ = fs::remove_file(old.block_index_path);
             let _ = fs::remove_file(old.bloom_path);
+            let _ = fs::remove_file(old.fence_path);
         }
 
         self.levels[next_level].push(output);
@@ -580,9 +583,10 @@ impl Db {
                         &table.block_index_path,
                         &table.index_path,
                         &table.bloom_path,
+                        &table.fence_path,
                     )?
                 } else {
-                    TableCache::load(&table.data_path, &table.index_path, &table.bloom_path)?
+                    TableCache::load(&table.data_path, &table.index_path, &table.bloom_path, &table.fence_path)?
                 });
             }
             out.push(cached_level);
