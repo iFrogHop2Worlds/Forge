@@ -302,6 +302,9 @@ impl Db {
     }
 
     /// Retrieves a value while bypassing the decoded block cache.
+    /// Used for sequential reads where we do not want to pay
+    /// the overhead cost of LRU cache and can simply use the
+    /// SSTABLE/index read path.
     pub fn get_uncached(&self, key: &str) -> Result<Option<Vec<u8>>> {
         if let Some((_, v)) = self.memtable.get(key) {
             return match v {

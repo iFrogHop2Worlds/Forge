@@ -21,7 +21,7 @@ pub trait DbIterator {
 ///
 /// # Example
 ///
-/// ```rust
+/// ```
 /// use ForgeEngine::TableIterator;
 ///
 /// let sstable_iterator = SstableIterator::new(...); // Initialize the SstableIterator

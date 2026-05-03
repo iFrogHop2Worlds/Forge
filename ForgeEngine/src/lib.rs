@@ -14,7 +14,8 @@ pub use types::{ForgeError, Result};
 mod tests {
     use std::fs;
     use std::path::PathBuf;
-    use std::time::Instant;
+    use std::thread;
+    use std::time::{Duration, Instant};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::Db;
@@ -96,7 +97,7 @@ mod tests {
     #[test]
     #[ignore = "performance benchmark"]
     fn bench_random_writes_and_reads() {
-        const WRITE_COUNT: usize = 1_000_000;
+        const WRITE_COUNT: usize = 10_000_000;
         const READ_COUNT: usize = 100_000;
 
         fn next_u64(state: &mut u64) -> u64 {
@@ -121,8 +122,9 @@ mod tests {
             db.put(key, value).expect("put");
         }
         db.sync().expect("sync");
+        
         let write_elapsed = write_start.elapsed();
-
+        
         let read_start = Instant::now();
         for _ in 0..READ_COUNT {
             let idx = (next_u64(&mut rng_state) as usize) % inserted_keys.len();
